@@ -735,7 +735,7 @@ class ProxyServer:
                 )
 
             stall_watch = (
-                4.0
+                2.5
                 if (is_tls and not via_tunnel and used_strategy != "tunnel" and self.tunnel_port is not None)
                 else None
             )
