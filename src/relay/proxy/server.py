@@ -85,6 +85,7 @@ class ProxyServer:
         tunnel_host: str = "127.0.0.1",
         tunnel_port: int | None = None,
         managed_tunnel: MasqueTunnel | None = None,
+        bypass_loopback: bool = True,
     ):
         preset = MODE_PRESETS[mode]
         self.host = host
@@ -103,6 +104,7 @@ class ProxyServer:
         self.tunnel_host = tunnel_host
         self.tunnel_port = tunnel_port
         self._managed_tunnel = managed_tunnel
+        self.bypass_loopback = bypass_loopback
 
         self.resolver = DoHResolver(enabled=doh_enabled)
         self.strategies = StrategyCache(persist_path=learned_path)
@@ -524,6 +526,17 @@ class ProxyServer:
             tune_socket(writer)
             self.telemetry.on_connection_open()
             counted = True
+
+            # Loopback targets must NEVER go through DoH, DPI fragmentation, or MASQUE tunnel.
+            if self.bypass_loopback and (hostname in ("localhost", "127.0.0.1", "::1") or hostname.startswith("127.")):
+                upstream_reader, upstream = await open_upstream(hostname, port, timeout=4.0)
+                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await writer.drain()
+                connected = True
+                latency_ms = int((time.monotonic() - started) * 1000)
+                self.telemetry.record_event(hostname, "direct", True, latency_ms, "loopback")
+                await bridge_streams(reader, writer, upstream_reader, upstream, self.telemetry)
+                return
 
             cached = self.strategies.get(hostname)
             force_frag = domain_matches(hostname, self.force_fragment_domains)

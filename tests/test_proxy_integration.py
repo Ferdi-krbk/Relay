@@ -156,6 +156,7 @@ def test_proxy_server_socks5_tunnel_fallback():
             doh_enabled=False,
             prewarm_doh=False,
             tunnel_port=socks_port,
+            bypass_loopback=False,
         )
         await proxy.start()
         p_port = proxy.bound_port
