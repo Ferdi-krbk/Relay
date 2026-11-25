@@ -286,14 +286,18 @@ class ProxyServer:
         tunnel_task = asyncio.create_task(self._start_managed_tunnel()) if self._managed_tunnel is not None else None
         monitor_task = asyncio.create_task(self._network_monitor())
         try:
-            async with self._server:
-                serve_task = asyncio.create_task(self._server.serve_forever())
-                stop_task = asyncio.create_task(self.shutdown_event.wait())
-                _, pending = await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+            serve_task = asyncio.create_task(self._server.serve_forever())
+            stop_task = asyncio.create_task(self.shutdown_event.wait())
+            _, pending = await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
         finally:
+            self._server.close()
+            if hasattr(self._server, "close_clients"):
+                self._server.close_clients()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._server.wait_closed(), timeout=1.5)
             for bg in (warmup_task, tunnel_task, monitor_task):
                 if bg is not None:
                     bg.cancel()
@@ -307,8 +311,10 @@ class ProxyServer:
         self.shutdown_event.set()
         if self._server is not None:
             self._server.close()
+            if hasattr(self._server, "close_clients"):
+                self._server.close_clients()
             with contextlib.suppress(Exception):
-                await self._server.wait_closed()
+                await asyncio.wait_for(self._server.wait_closed(), timeout=1.5)
         if self._managed_tunnel is not None:
             self._managed_tunnel.stop()
         self.resolver.close()
