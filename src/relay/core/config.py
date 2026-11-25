@@ -25,16 +25,34 @@ DEFAULT_FORCE_DOMAINS: tuple[str, ...] = (
     "pastebin.com",
 )
 
-# Domains routed directly through the user-space MASQUE SOCKS5 tunnel when Strict mode is active.
-STRICT_TUNNEL_DOMAINS: tuple[str, ...] = (
-    "roblox.com",
-    "rbxcdn.com",
-    "steampowered.com",
-    "steamcommunity.com",
-    "steamstatic.com",
-    "steamserver.net",
-    "steamcontent.com",
-    "epicgames.com",
+# Major unblocked high-bandwidth services kept direct in Strict (Tünel) mode
+# so video/productivity stays at full native speed while all other domains use MASQUE.
+STRICT_DIRECT_DOMAINS: tuple[str, ...] = (
+    "google.com",
+    "googleapis.com",
+    "gstatic.com",
+    "googleusercontent.com",
+    "googlevideo.com",
+    "youtube.com",
+    "ytimg.com",
+    "ggpht.com",
+    "microsoft.com",
+    "msftconnecttest.com",
+    "office.com",
+    "live.com",
+    "windowsupdate.com",
+    "github.com",
+    "githubusercontent.com",
+    "apple.com",
+    "icloud.com",
+    "whatsapp.com",
+    "whatsapp.net",
+    "chatgpt.com",
+    "openai.com",
+    "claude.ai",
+    "anthropic.com",
+    "cloudflare-dns.com",
+    "dns.google",
 )
 
 

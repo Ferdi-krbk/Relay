@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 from relay.core.config import (
     MODE_PRESETS,
-    STRICT_TUNNEL_DOMAINS,
+    STRICT_DIRECT_DOMAINS,
     TUNNEL_PORT,
     NetworkMode,
     default_data_dir,
@@ -129,7 +129,7 @@ class ProxyServer:
             return True
         if self._root_domain(hostname) in self._tunnel_roots:
             return True
-        if self.mode == NetworkMode.STRICT and domain_matches(hostname, STRICT_TUNNEL_DOMAINS):
+        if self.mode == NetworkMode.STRICT and not domain_matches(hostname, STRICT_DIRECT_DOMAINS):
             return True
         return False
 
@@ -722,18 +722,30 @@ class ProxyServer:
                 writer.write(first_response)
                 await writer.drain()
             else:
+                used_strategy = "tunnel" if via_tunnel else "direct"
                 upstream.write(hello)
                 await upstream.drain()
                 latency_ms = int((time.monotonic() - started) * 1000)
                 self.telemetry.record_event(
                     hostname,
-                    "tunnel" if via_tunnel else "direct",
+                    used_strategy,
                     True,
                     latency_ms,
                     "MASQUE" if via_tunnel else "plain",
                 )
 
-            await bridge_streams(reader, writer, upstream_reader, upstream, self.telemetry)
+            stall_watch = (
+                4.0
+                if (is_tls and not via_tunnel and used_strategy != "tunnel" and self.tunnel_port is not None)
+                else None
+            )
+            stalled = await bridge_streams(
+                reader, writer, upstream_reader, upstream, self.telemetry, stall_timeout=stall_watch
+            )
+            if stalled and hostname:
+                # Firewall allowed ServerHello then blackholed post-handshake traffic;
+                # close promptly so the browser retries directly over MASQUE.
+                self._record_tunnel_host(hostname)
         except (
             OSError,
             ValueError,
