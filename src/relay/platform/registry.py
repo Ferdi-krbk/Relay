@@ -110,12 +110,19 @@ class WindowsProxyStore:
 
     def apply_proxy(self, port: int, *, system_proxy: bool) -> None:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, SETTINGS_KEY, 0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
-            winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url_for_port(port))
             if system_proxy:
+                # When full System Proxy is enabled, do not also set AutoConfigURL:
+                # Chromium/Electron apps (e.g. Antigravity Hub) race cold-start PAC fetches
+                # against local https://127.0.0.1:<port>/ loads and fail with ERR_FAILED (-2).
+                with contextlib.suppress(FileNotFoundError):
+                    cur_pac = winreg.QueryValueEx(key, "AutoConfigURL")[0]
+                    if isinstance(cur_pac, str) and "127.0.0.1:" in cur_pac and cur_pac.endswith("/proxy.pac"):
+                        winreg.DeleteValue(key, "AutoConfigURL")
                 winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
                 winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"127.0.0.1:{port}")
                 winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, PROXY_OVERRIDE)
             else:
+                winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url_for_port(port))
                 winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
                 with contextlib.suppress(FileNotFoundError):
                     cur_srv = winreg.QueryValueEx(key, "ProxyServer")[0]
