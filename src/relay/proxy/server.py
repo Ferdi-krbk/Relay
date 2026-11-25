@@ -108,6 +108,9 @@ class ProxyServer:
         self.strategies = StrategyCache(persist_path=learned_path)
         self._doh_hosts: set[str] = set()
         self._tunnel_roots: set[str] = set()
+        self._tunnel_failures = 0
+        self._last_tunnel_restart = 0.0
+        self._tunnel_restarting = False
         self.telemetry = ProxyTelemetry(mode=mode.value, doh_enabled=doh_enabled)
         self.shutdown_event = asyncio.Event()
         self._server: asyncio.Server | None = None
@@ -149,10 +152,34 @@ class ProxyServer:
                 flush=True,
             )
 
+    async def _restart_managed_tunnel(self) -> None:
+        if self._managed_tunnel is None or self._tunnel_restarting:
+            return
+        now = time.monotonic()
+        if now - self._last_tunnel_restart < 10.0:
+            return
+        self._tunnel_restarting = True
+        self._last_tunnel_restart = now
+        try:
+            await asyncio.to_thread(self._managed_tunnel.stop)
+            ok = await asyncio.to_thread(self._managed_tunnel.start)
+            self.tunnel_port = self._managed_tunnel.port if ok else None
+            self._tunnel_failures = 0
+        finally:
+            self._tunnel_restarting = False
+
     async def _open_tunnel(self, hostname: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         if self.tunnel_port is None:
             raise ConnectionError("Tunnel fallback is not active")
-        return await open_socks5_upstream(self.tunnel_host, self.tunnel_port, hostname, port, timeout=6.0)
+        try:
+            res = await open_socks5_upstream(self.tunnel_host, self.tunnel_port, hostname, port, timeout=5.0)
+            self._tunnel_failures = 0
+            return res
+        except (OSError, asyncio.TimeoutError):
+            self._tunnel_failures += 1
+            if self._tunnel_failures >= 2 and self._managed_tunnel is not None:
+                asyncio.create_task(self._restart_managed_tunnel())
+            raise
 
     def flush_caches(self, *, clear_persisted: bool = False) -> None:
         """Reset strategy cache, DoH-required host set, and pooled DoH sockets."""
@@ -501,6 +528,7 @@ class ProxyServer:
                     self.strategies.invalidate(hostname)
                     cached = None
 
+            connect_timeout = 3.0 if self.tunnel_port is not None else 8.0
             if not via_tunnel:
                 # Smart DNS: Normal unblocked hosts use instant system DNS (local CDN edge);
                 # DoH is used upfront only for forced domains or hosts that previously needed DoH.
@@ -509,7 +537,7 @@ class ProxyServer:
                 target_host = resolved_ip or hostname
 
                 try:
-                    upstream_reader, upstream = await open_upstream(target_host, port)
+                    upstream_reader, upstream = await open_upstream(target_host, port, timeout=connect_timeout)
                 except (OSError, asyncio.TimeoutError):
                     opened = False
                     if not resolved_ip and self.resolver.enabled:
@@ -517,13 +545,15 @@ class ProxyServer:
                         if resolved_ip:
                             target_host = resolved_ip
                             with contextlib.suppress(OSError, asyncio.TimeoutError):
-                                upstream_reader, upstream = await open_upstream(target_host, port)
+                                upstream_reader, upstream = await open_upstream(
+                                    target_host, port, timeout=connect_timeout
+                                )
                                 self._doh_hosts.add(hostname)
                                 opened = True
                     elif resolved_ip:
                         target_host = hostname
                         with contextlib.suppress(OSError, asyncio.TimeoutError):
-                            upstream_reader, upstream = await open_upstream(hostname, port)
+                            upstream_reader, upstream = await open_upstream(hostname, port, timeout=connect_timeout)
                             opened = True
                     if not opened:
                         if self.tunnel_port is not None:
