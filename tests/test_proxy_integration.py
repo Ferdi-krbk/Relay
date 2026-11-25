@@ -201,3 +201,12 @@ def test_root_domain_handles_multi_part_tlds():
     assert ProxyServer._root_domain("sub.example.com.tr") == "example.com.tr"
     assert ProxyServer._root_domain("news.bbc.co.uk") == "bbc.co.uk"
     assert ProxyServer._root_domain("discord.com") == "discord.com"
+
+
+def test_strict_direct_domains_never_promoted_to_tunnel():
+    proxy = ProxyServer(port=0, mode=NetworkMode.AUTO, doh_enabled=False, prewarm_doh=False, tunnel_port=11894)
+    proxy._record_tunnel_host("rr2---sn-u0g3oxu.googlevideo.com")
+    proxy._record_tunnel_host("www.youtube.com")
+    assert proxy.strategies.get("rr2---sn-u0g3oxu.googlevideo.com") is None
+    assert "googlevideo.com" not in proxy._tunnel_roots
+    assert "youtube.com" not in proxy._tunnel_roots

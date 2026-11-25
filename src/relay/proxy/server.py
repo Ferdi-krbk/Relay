@@ -24,7 +24,7 @@ from relay.core.pac import generate_pac
 from relay.core.telemetry import ProxyTelemetry
 from relay.proxy.doh import DoHResolver
 from relay.proxy.dpi import StrategyCache, exchange_hello, race_client_hello, read_client_hello
-from relay.proxy.pipe import STREAM_LIMIT_BYTES, bridge_streams, open_upstream, tune_socket
+from relay.proxy.pipe import STREAM_LIMIT_BYTES, PipeProtocol, bridge_streams, open_upstream, tune_socket
 from relay.proxy.tunnel import MasqueTunnel, open_socks5_upstream
 
 
@@ -116,6 +116,23 @@ class ProxyServer:
         self.telemetry = ProxyTelemetry(mode=mode.value, doh_enabled=doh_enabled)
         self.shutdown_event = asyncio.Event()
         self._server: asyncio.Server | None = None
+        self._active_transports: set[asyncio.BaseTransport] = set()
+
+    def _track_stream(self, stream: asyncio.StreamWriter | None) -> None:
+        if stream is not None and stream.transport is not None:
+            self._active_transports.add(stream.transport)
+
+    def _untrack_stream(self, stream: asyncio.StreamWriter | None) -> None:
+        if stream is not None and stream.transport is not None:
+            self._active_transports.discard(stream.transport)
+
+    def _close_active_transports(self) -> None:
+        for tr in list(self._active_transports):
+            with contextlib.suppress(Exception):
+                tr.close()
+            with contextlib.suppress(Exception):
+                tr.abort()
+        self._active_transports.clear()
 
     @staticmethod
     def _root_domain(hostname: str) -> str:
@@ -136,9 +153,11 @@ class ProxyServer:
         return False
 
     def _record_tunnel_host(self, hostname: str) -> None:
+        if domain_matches(hostname, STRICT_DIRECT_DOMAINS):
+            return
         self.strategies.set(hostname, "tunnel", persist=False)
         root = self._root_domain(hostname)
-        if root:
+        if root and not domain_matches(root, STRICT_DIRECT_DOMAINS):
             self._tunnel_roots.add(root)
             if root == "roblox.com":
                 self._tunnel_roots.add("rbxcdn.com")
@@ -298,6 +317,7 @@ class ProxyServer:
             self._server.close()
             if hasattr(self._server, "close_clients"):
                 self._server.close_clients()
+            self._close_active_transports()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._server.wait_closed(), timeout=1.5)
             for bg in (warmup_task, tunnel_task, monitor_task):
@@ -315,8 +335,11 @@ class ProxyServer:
             self._server.close()
             if hasattr(self._server, "close_clients"):
                 self._server.close_clients()
+            self._close_active_transports()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._server.wait_closed(), timeout=1.5)
+        else:
+            self._close_active_transports()
         if self._managed_tunnel is not None:
             self._managed_tunnel.stop()
         self.resolver.close()
@@ -481,6 +504,7 @@ class ProxyServer:
                 and not ln.lower().startswith(b"connection:")
             ]
             rebuilt = b"\r\n".join([new_first, *header_lines, b"Connection: close", b"", b""])
+            self._track_stream(upstream)
             upstream.write(rebuilt)
             await upstream.drain()
             latency_ms = int((time.monotonic() - started) * 1000)
@@ -488,6 +512,7 @@ class ProxyServer:
             await bridge_streams(reader, writer, upstream_reader, upstream, self.telemetry)
             return upstream
         finally:
+            self._untrack_stream(upstream)
             self.telemetry.on_connection_close()
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -496,6 +521,7 @@ class ProxyServer:
         counted = False
         hostname = ""
         started = time.monotonic()
+        self._track_stream(writer)
 
         try:
             request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10.0)
@@ -530,6 +556,7 @@ class ProxyServer:
             # Loopback targets must NEVER go through DoH, DPI fragmentation, or MASQUE tunnel.
             if self.bypass_loopback and (hostname in ("localhost", "127.0.0.1", "::1") or hostname.startswith("127.")):
                 upstream_reader, upstream = await open_upstream(hostname, port, timeout=4.0)
+                self._track_stream(upstream)
                 writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 await writer.drain()
                 connected = True
@@ -753,11 +780,23 @@ class ProxyServer:
                     "MASQUE" if via_tunnel else "plain",
                 )
 
+            # Only watch for post-ServerHello blackholes on non-whitelisted hosts whose
+            # initial TLS flight looked incomplete (< 1500 bytes); never cut live streams
+            # (e.g. YouTube LL-HLS / googlevideo) or IP-bound video CDNs.
+            first_resp_len = len(first_response) if is_tls else 0
             stall_watch = (
-                2.5
-                if (is_tls and not via_tunnel and used_strategy != "tunnel" and self.tunnel_port is not None)
+                4.5
+                if (
+                    is_tls
+                    and not via_tunnel
+                    and used_strategy != "tunnel"
+                    and self.tunnel_port is not None
+                    and first_resp_len < 1500
+                    and not domain_matches(hostname, STRICT_DIRECT_DOMAINS)
+                )
                 else None
             )
+            self._track_stream(upstream)
             stalled = await bridge_streams(
                 reader, writer, upstream_reader, upstream, self.telemetry, stall_timeout=stall_watch
             )
@@ -791,9 +830,14 @@ class ProxyServer:
                 self.telemetry.on_connection_close()
             for stream in (writer, upstream):
                 if stream is not None:
+                    self._untrack_stream(stream)
                     stream.close()
-                    with contextlib.suppress(OSError):
-                        await stream.wait_closed()
+                    tr = stream.transport
+                    # Once PipeProtocol replaces StreamReaderProtocol, stream.wait_closed()
+                    # can hang indefinitely on shutdown because _closed is owned by the old protocol.
+                    if tr is None or not isinstance(tr.get_protocol(), PipeProtocol):
+                        with contextlib.suppress(OSError, asyncio.TimeoutError):
+                            await asyncio.wait_for(stream.wait_closed(), timeout=0.5)
 
 
 async def run_proxy_server(args) -> None:
