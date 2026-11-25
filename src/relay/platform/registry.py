@@ -15,7 +15,7 @@ SETTINGS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 RUNONCE_KEY = r"Software\Microsoft\Windows\CurrentVersion\RunOnce"
 RUNONCE_NAME = "RelayRestoreProxy"
 TRACKED_VALUES: tuple[str, ...] = ("ProxyEnable", "AutoConfigURL", "ProxyServer", "ProxyOverride")
-PROXY_OVERRIDE = "localhost;127.*;10.*;172.16.*;192.168.*;<local>"
+PROXY_OVERRIDE = "localhost;127.0.0.1;127.*;[::1];::1;10.*;172.16.*;192.168.*;<local>"
 
 
 class ProxySettingsStore(Protocol):

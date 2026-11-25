@@ -24,7 +24,7 @@ def generate_pac(port: int, bypass_domains: Iterable[str] = ()) -> bytes:
     script = (
         "function FindProxyForURL(url, host) {"
         'host = host.toLowerCase().replace(/\\.$/, ""); '
-        'if (isPlainHostName(host) || host === "localhost" || host === "127.0.0.1" || host === "::1" || '
+        'if (isPlainHostName(host) || host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]" || '
         '/^(10\\.|127\\.|192\\.168\\.|172\\.(1[6-9]|2\\d|3[01])\\.)/.test(host)) return "DIRECT"; '
         "var proto = url.substring(0, 6).toLowerCase(); "
         'if (proto !== "https:" && proto !== "wss://" && proto.substring(0, 5) !== "http:") return "DIRECT"; '
