@@ -218,9 +218,7 @@ class MasqueTunnel:
     def stop(self) -> None:
         proc = self._process
         self._process = None
-        if proc is None:
-            return
-        if proc.poll() is None:
+        if proc is not None and proc.poll() is None:
             with contextlib.suppress(OSError):
                 proc.terminate()
             try:
@@ -228,3 +226,30 @@ class MasqueTunnel:
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(OSError):
                     proc.kill()
+
+        # Also clean up any orphaned usque listener on self.port if _process wasn't tracked.
+        if self.is_ready():
+            pids: set[int] = set()
+            with contextlib.suppress(Exception):
+                out = subprocess.check_output(
+                    ["netstat", "-ano", "-p", "TCP"],
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    timeout=3,
+                    text=True,
+                )
+                target = f"{self.host}:{self.port}"
+                for line in out.splitlines():
+                    if target in line and "LISTENING" in line:
+                        parts = line.split()
+                        if parts and parts[-1].isdigit():
+                            pids.add(int(parts[-1]))
+            taskkill = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe")
+            for pid in pids:
+                with contextlib.suppress(Exception):
+                    subprocess.run(
+                        [taskkill, "/PID", str(pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        timeout=5,
+                    )

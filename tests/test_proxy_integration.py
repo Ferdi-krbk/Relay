@@ -193,3 +193,10 @@ def test_proxy_server_socks5_tunnel_fallback():
             await socks_srv.wait_closed()
 
     asyncio.run(_run())
+
+
+def test_root_domain_handles_multi_part_tlds():
+    assert ProxyServer._root_domain("www.roblox.com") == "roblox.com"
+    assert ProxyServer._root_domain("sub.example.com.tr") == "example.com.tr"
+    assert ProxyServer._root_domain("news.bbc.co.uk") == "bbc.co.uk"
+    assert ProxyServer._root_domain("discord.com") == "discord.com"

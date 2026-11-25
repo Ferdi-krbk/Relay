@@ -117,8 +117,10 @@ class ProxyServer:
 
     @staticmethod
     def _root_domain(hostname: str) -> str:
-        parts = hostname.lower().rstrip(".").split(".")
-        return ".".join(parts[-2:]) if len(parts) >= 2 else hostname.lower().rstrip(".")
+        parts = [p for p in hostname.lower().rstrip(".").split(".") if p]
+        if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in ("co", "com", "org", "net", "edu", "gov", "ac"):
+            return ".".join(parts[-3:])
+        return ".".join(parts[-2:]) if len(parts) >= 2 else (parts[0] if parts else "")
 
     def _should_use_tunnel_directly(self, hostname: str, cached: str | None) -> bool:
         if self.tunnel_port is None:
@@ -168,17 +170,19 @@ class ProxyServer:
         finally:
             self._tunnel_restarting = False
 
+    def _on_tunnel_failure(self) -> None:
+        self._tunnel_failures += 1
+        if self._tunnel_failures >= 2 and self._managed_tunnel is not None:
+            asyncio.create_task(self._restart_managed_tunnel())
+
     async def _open_tunnel(self, hostname: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         if self.tunnel_port is None:
             raise ConnectionError("Tunnel fallback is not active")
         try:
             res = await open_socks5_upstream(self.tunnel_host, self.tunnel_port, hostname, port, timeout=5.0)
-            self._tunnel_failures = 0
             return res
         except (OSError, asyncio.TimeoutError):
-            self._tunnel_failures += 1
-            if self._tunnel_failures >= 2 and self._managed_tunnel is not None:
-                asyncio.create_task(self._restart_managed_tunnel())
+            self._on_tunnel_failure()
             raise
 
     def flush_caches(self, *, clear_persisted: bool = False) -> None:
@@ -239,6 +243,8 @@ class ProxyServer:
                 self.flush_caches(clear_persisted=False)
                 if self.prewarm_doh and self.resolver.enabled:
                     asyncio.create_task(self.resolver.prewarm())
+                if self._managed_tunnel is not None:
+                    asyncio.create_task(self._restart_managed_tunnel())
             if (
                 self._managed_tunnel is not None
                 and not self._managed_tunnel.available
@@ -573,17 +579,25 @@ class ProxyServer:
             hello, is_tls = await read_client_hello(reader)
             if is_tls:
                 if via_tunnel:
-                    upstream_reader, upstream, first_response = await exchange_hello(
-                        upstream_reader, upstream, hello, hostname, 0.0, "direct", timeout=6.0
-                    )
+                    try:
+                        upstream_reader, upstream, first_response = await exchange_hello(
+                            upstream_reader, upstream, hello, hostname, 0.0, "direct", timeout=6.0
+                        )
+                        self._tunnel_failures = 0
+                    except (OSError, asyncio.TimeoutError):
+                        self._on_tunnel_failure()
+                        raise
                     used_strategy = "tunnel"
                 else:
                     used_strategy = cached or "direct"
-                    tunnel_cb = (
-                        (lambda h=hostname, p=port: self._open_tunnel(h, p))
-                        if self.tunnel_port is not None
-                        else None
-                    )
+                    tunnel_tried = False
+
+                    async def _tracked_tunnel_open(h: str = hostname, p: int = port):
+                        nonlocal tunnel_tried
+                        tunnel_tried = True
+                        return await self._open_tunnel(h, p)
+
+                    tunnel_cb = _tracked_tunnel_open if self.tunnel_port is not None else None
                     try:
                         if cached:
                             try:
@@ -596,7 +610,9 @@ class ProxyServer:
                                     resolved_ip = await self.resolver.resolve(hostname)
                                     if resolved_ip:
                                         target_host = resolved_ip
-                                upstream_reader, upstream = await open_upstream(target_host, port)
+                                upstream_reader, upstream = await open_upstream(
+                                    target_host, port, timeout=connect_timeout
+                                )
                                 (upstream_reader, upstream, first_response), used_strategy = await race_client_hello(
                                     upstream_reader,
                                     upstream,
@@ -613,6 +629,7 @@ class ProxyServer:
                                     tunnel_connect=tunnel_cb,
                                 )
                                 if used_strategy == "tunnel":
+                                    self._tunnel_failures = 0
                                     self._record_tunnel_host(hostname)
                                 else:
                                     if resolved_ip and used_strategy != "direct":
@@ -644,7 +661,9 @@ class ProxyServer:
                                     resolved_ip = await self.resolver.resolve(hostname)
                                     if resolved_ip and resolved_ip != upstream_ip:
                                         target_host = resolved_ip
-                                        upstream_reader, upstream = await open_upstream(target_host, port)
+                                        upstream_reader, upstream = await open_upstream(
+                                            target_host, port, timeout=connect_timeout
+                                        )
                                         (upstream_reader, upstream, first_response), used_strategy = (
                                             await race_client_hello(
                                                 upstream_reader,
@@ -659,7 +678,7 @@ class ProxyServer:
                                                 race_both=self.race_both,
                                                 force_fragment=True,
                                                 hello_timeout=hello_timeout,
-                                                tunnel_connect=tunnel_cb,
+                                                tunnel_connect=None if tunnel_tried else tunnel_cb,
                                             )
                                         )
                                         self._doh_hosts.add(hostname)
@@ -668,6 +687,7 @@ class ProxyServer:
                                 else:
                                     raise
                             if used_strategy == "tunnel":
+                                self._tunnel_failures = 0
                                 self._record_tunnel_host(hostname)
                             else:
                                 self.strategies.set(
@@ -679,12 +699,19 @@ class ProxyServer:
                                     ),
                                 )
                     except (OSError, asyncio.TimeoutError):
-                        if self.tunnel_port is None:
+                        if self.tunnel_port is None or tunnel_tried:
+                            if tunnel_tried:
+                                self._on_tunnel_failure()
                             raise
                         upstream_reader, upstream = await self._open_tunnel(hostname, port)
-                        upstream_reader, upstream, first_response = await exchange_hello(
-                            upstream_reader, upstream, hello, hostname, 0.0, "direct", timeout=6.0
-                        )
+                        try:
+                            upstream_reader, upstream, first_response = await exchange_hello(
+                                upstream_reader, upstream, hello, hostname, 0.0, "direct", timeout=6.0
+                            )
+                            self._tunnel_failures = 0
+                        except (OSError, asyncio.TimeoutError):
+                            self._on_tunnel_failure()
+                            raise
                         used_strategy = "tunnel"
                         self._record_tunnel_host(hostname)
 
