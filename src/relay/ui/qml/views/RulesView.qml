@@ -256,6 +256,13 @@ ScrollView {
                         onAccepted: { network.addGameApp(text); text = "" }
                     }
                     Rectangle {
+                        width: 54; height: 30; radius: 7; antialiasing: true
+                        color: root.theme.recess
+                        border.color: root.theme.hairline
+                        BodyText { anchors.centerIn: parent; text: "Seç…"; font.pixelSize: 11; color: root.theme.ink }
+                        PressArea { anchors.fill: parent; onInvoke: network.browseGameApp() }
+                    }
+                    Rectangle {
                         width: 48; height: 30; radius: 7; antialiasing: true; color: root.theme.ink
                         BodyText { anchors.centerIn: parent; text: "Ekle"; font.pixelSize: 11; color: "#FDFCFA" }
                         PressArea { anchors.fill: parent; onInvoke: { network.addGameApp(gIn.text); gIn.text = "" } }
@@ -276,6 +283,38 @@ ScrollView {
                                 BodyText { text: "×"; font.pixelSize: 11; color: root.theme.forest }
                             }
                             PressArea { anchors.fill: parent; onInvoke: network.removeGameApp(modelData) }
+                        }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 8
+                    BodyText { text: "Açık Uygulamalardan Ekle"; font.pixelSize: 11; color: root.theme.inkMuted }
+                    Item { Layout.fillWidth: true }
+                    Rectangle {
+                        width: 64; height: 22; radius: 6; antialiasing: true
+                        color: root.theme.recess; border.color: root.theme.hairline
+                        BodyText { anchors.centerIn: parent; text: "↻ Tara"; font.pixelSize: 10; color: root.theme.inkSoft }
+                        PressArea { anchors.fill: parent; onInvoke: network.refreshRunningApps() }
+                    }
+                }
+                Flow {
+                    Layout.fillWidth: true; spacing: 5
+                    visible: network.runningApps.length > 0
+                    Component.onCompleted: network.refreshRunningApps()
+                    Repeater {
+                        model: network.runningApps
+                        delegate: Rectangle {
+                            required property string modelData
+                            height: 24; width: rcT.implicitWidth + 24; radius: 6; antialiasing: true
+                            color: root.theme.canvas
+                            border.color: root.theme.hairline
+                            Row {
+                                anchors.centerIn: parent; spacing: 5
+                                BodyText { text: "+"; font.pixelSize: 11; color: root.theme.inkSoft }
+                                MonoText { id: rcT; text: modelData; font.pixelSize: 10; color: root.theme.inkSoft }
+                            }
+                            PressArea { anchors.fill: parent; onInvoke: network.addGameApp(modelData) }
                         }
                     }
                 }

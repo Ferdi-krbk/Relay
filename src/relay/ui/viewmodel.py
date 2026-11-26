@@ -2,13 +2,72 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import ctypes
+from ctypes import wintypes
 import os
+from pathlib import Path
 
 from PySide6.QtCore import Property, QObject, QTimer, Qt, Signal, Slot
+from PySide6.QtWidgets import QFileDialog
 
 from relay.core.config import NetworkMode, sanitize_app_name, sanitize_domain
 from relay.platform.startup import is_startup_enabled, set_startup_enabled
 from relay.service.controller import RelayService, ServiceStatus
+
+
+_IGNORED_RUNNING_APPS = frozenset(
+    {
+        "relay.exe",
+        "explorer.exe",
+        "applicationframehost.exe",
+        "textinputhost.exe",
+        "systemsettings.exe",
+        "shellexperiencehost.exe",
+        "searchhost.exe",
+        "startmenuexperiencehost.exe",
+        "lockapp.exe",
+        "nvidia overlay.exe",
+    }
+)
+
+
+def list_visible_window_apps() -> list[str]:
+    """Return sorted unique .exe names of currently visible desktop windows (zero-subprocess)."""
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        pids: set[int] = set()
+
+        enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            if user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd) > 0:
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value:
+                    pids.add(int(pid.value))
+            return True
+
+        user32.EnumWindows(enum_proc(_cb), 0)
+
+        names: dict[str, str] = {}
+        buf = ctypes.create_unicode_buffer(512)
+        for pid in pids:
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                continue
+            try:
+                size = wintypes.DWORD(512)
+                if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                    exe = Path(buf.value).name
+                    if exe.lower().endswith(".exe") and exe.lower() not in _IGNORED_RUNNING_APPS:
+                        names.setdefault(exe.lower(), exe)
+            finally:
+                kernel32.CloseHandle(h)
+        return sorted(names.values(), key=str.lower)
+    except Exception:
+        return []
 
 
 def format_rate(bps: float) -> str:
@@ -168,6 +227,16 @@ class RelayViewModel(QObject):
     @Property("QVariantList", notify=changed)
     def gameApps(self) -> list:
         return list(self.service.config.game_mode_apps)
+
+    @Property("QVariantList", notify=changed)
+    def runningApps(self) -> list:
+        existing = {a.lower() for a in self.service.config.game_mode_apps}
+        return [a for a in getattr(self, "_running_apps", []) if a.lower() not in existing]
+
+    @Slot()
+    def refreshRunningApps(self) -> None:
+        self._running_apps = list_visible_window_apps()
+        self.changed.emit()
 
     # --- Telemetry ---
     def _stats(self) -> dict:
@@ -389,6 +458,18 @@ class RelayViewModel(QObject):
             self._dispatch("action", self.service.enable_game_mode)
         else:
             self.changed.emit()
+
+    @Slot()
+    def browseGameApp(self) -> None:
+        """Open native Windows file picker to select any .exe for Game Mode split-tunnel."""
+        path, _ = QFileDialog.getOpenFileName(
+            None,
+            "Tünel Uygulaması Seç",
+            os.environ.get("ProgramFiles", "C:\\"),
+            "Uygulamalar (*.exe);;Tüm Dosyalar (*.*)",
+        )
+        if path:
+            self.addGameApp(path)
 
     @Slot(str)
     def removeGameApp(self, app_name: str) -> None:
