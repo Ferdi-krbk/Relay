@@ -91,6 +91,22 @@ def _run_worker(argv: list[str]) -> None:
         pass
 
 
+def _run_game_tunnel(argv: list[str]) -> None:
+    import argparse
+
+    from relay.core.config import GAME_CONTROL_PORT
+    from relay.proxy.gametunnel import run_game_tunnel_supervisor
+
+    parser = argparse.ArgumentParser(prog="relay --game-tunnel")
+    parser.add_argument("--game-tunnel", action="store_true")
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--control-port", type=int, default=GAME_CONTROL_PORT)
+    parser.add_argument("--parent-pid", type=int, default=0)
+    parser.add_argument("--token", type=str, default="")
+    args = parser.parse_args(argv)
+    run_game_tunnel_supervisor(args)
+
+
 def _run_ui(argv: list[str]) -> None:
     from relay.ui.app import run_desktop_app
 
@@ -101,6 +117,8 @@ def main(argv: list[str] | None = None) -> None:
     args = sys.argv[1:] if argv is None else argv
     if "--proxy-worker" in args:
         _run_worker(args)
+    elif "--game-tunnel" in args:
+        _run_game_tunnel(args)
     elif "--restore-proxy" in args:
         _run_restore()
     else:

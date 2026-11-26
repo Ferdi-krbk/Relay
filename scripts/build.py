@@ -55,9 +55,10 @@ def main() -> None:
         if (qt_dir / dll).is_file():
             command.extend(["--add-binary", f"{qt_dir / dll}{os.pathsep}."])
 
-    usque_bin = ROOT / "bin" / "usque.exe"
-    if usque_bin.is_file():
-        command.extend(["--add-binary", f"{usque_bin}{os.pathsep}relay_bin"])
+    for bin_name in ("usque.exe", "sing-box.exe", "wintun.dll"):
+        bin_path = ROOT / "bin" / bin_name
+        if bin_path.is_file():
+            command.extend(["--add-binary", f"{bin_path}{os.pathsep}relay_bin"])
 
     for excluded in (
         "numpy",

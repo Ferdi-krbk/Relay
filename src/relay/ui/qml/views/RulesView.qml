@@ -60,6 +60,17 @@ ScrollView {
                     spacing: 12
                     Column {
                         Layout.fillWidth: true; spacing: 1
+                        BodyText { width: parent.width; text: "Oyun / Uygulama Modu (Split-TUN)"; font.weight: Font.Medium; color: root.theme.ink }
+                        BodyText { width: parent.width; wrapMode: Text.WordWrap; text: "Sadece aşağıdaki listedeki oyun/uygulamaları (Roblox vb.) MASQUE tüneline yönlendirir; diğer trafik direkt kalır. Yönetici izni ister."; font.pixelSize: 11; color: root.theme.inkMuted }
+                    }
+                    CeramicSwitch { checked: network.gameModeActive; onToggled: function(v) { network.setGameMode(v) } }
+                }
+                Rectangle { width: parent.width; height: 1; color: root.theme.hairline }
+                RowLayout {
+                    width: parent.width
+                    spacing: 12
+                    Column {
+                        Layout.fillWidth: true; spacing: 1
                         BodyText { width: parent.width; text: "Hareket Efektleri"; font.weight: Font.Medium; color: root.theme.ink }
                         BodyText { width: parent.width; wrapMode: Text.WordWrap; text: "Açılış/kapanış koreografisi ve yumuşak sekme geçişleri."; font.pixelSize: 11; color: root.theme.inkMuted }
                     }
@@ -200,6 +211,71 @@ ScrollView {
                                 }
                                 PressArea { anchors.fill: parent; onInvoke: network.removeBypassDomain(modelData) }
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Game Mode Split-Tunnel Apps
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.leftMargin: 26
+            Layout.rightMargin: 26
+            implicitHeight: gCol.implicitHeight + 28
+            radius: 15
+            antialiasing: true
+            color: root.theme.card
+            border.color: network.gameModeActive ? "#EAC8BE" : root.theme.hairline
+
+            ColumnLayout {
+                id: gCol
+                anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+                anchors.margins: 14
+                spacing: 8
+
+                BodyText {
+                    text: network.gameModeActive ? "Tünel Uygulamaları (Oyun Modu Aktif)" : "Tünel Uygulamaları (.exe)"
+                    font.pixelSize: 12; font.weight: Font.Medium
+                    color: network.gameModeActive ? root.theme.vermilion : root.theme.ink
+                }
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 6
+                    TextField {
+                        id: gIn
+                        Layout.fillWidth: true; height: 30
+                        placeholderText: "RobloxPlayerBeta.exe"
+                        color: root.theme.ink
+                        placeholderTextColor: root.theme.inkMuted
+                        font.pixelSize: 11
+                        background: Rectangle {
+                            radius: 7; antialiasing: true
+                            color: root.theme.canvas
+                            border.color: gIn.activeFocus ? root.theme.ink : root.theme.hairline
+                        }
+                        onAccepted: { network.addGameApp(text); text = "" }
+                    }
+                    Rectangle {
+                        width: 48; height: 30; radius: 7; antialiasing: true; color: root.theme.ink
+                        BodyText { anchors.centerIn: parent; text: "Ekle"; font.pixelSize: 11; color: "#FDFCFA" }
+                        PressArea { anchors.fill: parent; onInvoke: { network.addGameApp(gIn.text); gIn.text = "" } }
+                    }
+                }
+                Flow {
+                    Layout.fillWidth: true; spacing: 5
+                    Repeater {
+                        model: network.gameApps
+                        delegate: Rectangle {
+                            required property string modelData
+                            height: 24; width: gcT.implicitWidth + 24; radius: 6; antialiasing: true
+                            color: root.theme.forestSoft
+                            border.color: "#C5E3D4"
+                            Row {
+                                anchors.centerIn: parent; spacing: 6
+                                MonoText { id: gcT; text: modelData; font.pixelSize: 10; color: root.theme.forest }
+                                BodyText { text: "×"; font.pixelSize: 11; color: root.theme.forest }
+                            }
+                            PressArea { anchors.fill: parent; onInvoke: network.removeGameApp(modelData) }
                         }
                     }
                 }

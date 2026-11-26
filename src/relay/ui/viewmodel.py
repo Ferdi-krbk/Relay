@@ -6,7 +6,7 @@ import os
 
 from PySide6.QtCore import Property, QObject, QTimer, Qt, Signal, Slot
 
-from relay.core.config import NetworkMode, sanitize_domain
+from relay.core.config import NetworkMode, sanitize_app_name, sanitize_domain
 from relay.platform.startup import is_startup_enabled, set_startup_enabled
 from relay.service.controller import RelayService, ServiceStatus
 
@@ -160,6 +160,14 @@ class RelayViewModel(QObject):
     @Property("QVariantList", notify=changed)
     def forceDomains(self) -> list:
         return list(self.service.config.force_fragment_domains)
+
+    @Property(bool, notify=changed)
+    def gameModeActive(self) -> bool:
+        return bool(self._status.game_mode)
+
+    @Property("QVariantList", notify=changed)
+    def gameApps(self) -> list:
+        return list(self.service.config.game_mode_apps)
 
     # --- Telemetry ---
     def _stats(self) -> dict:
@@ -357,6 +365,42 @@ class RelayViewModel(QObject):
         self.service.update_config(force_fragment_domains=updated)
         self._reapply_if_connected()
 
+    @Slot(bool)
+    def setGameMode(self, enabled: bool) -> None:
+        if self._busy:
+            return
+        want = bool(enabled)
+        if want == self.gameModeActive:
+            return
+        self._busy = True
+        self._error = ""
+        self.changed.emit()
+        self._dispatch("action", self.service.enable_game_mode if want else self.service.disable_game_mode)
+
+    @Slot(str)
+    def addGameApp(self, raw: str) -> None:
+        app_name = sanitize_app_name(raw)
+        if not app_name or any(a.lower() == app_name.lower() for a in self.service.config.game_mode_apps):
+            return
+        self.service.update_config(game_mode_apps=(*self.service.config.game_mode_apps, app_name))
+        if self.gameModeActive and not self._busy:
+            self._busy = True
+            self.changed.emit()
+            self._dispatch("action", self.service.enable_game_mode)
+        else:
+            self.changed.emit()
+
+    @Slot(str)
+    def removeGameApp(self, app_name: str) -> None:
+        updated = tuple(a for a in self.service.config.game_mode_apps if a.lower() != app_name.lower())
+        self.service.update_config(game_mode_apps=updated)
+        if self.gameModeActive and not self._busy:
+            self._busy = True
+            self.changed.emit()
+            self._dispatch("action", self.service.enable_game_mode)
+        else:
+            self.changed.emit()
+
     @Slot()
     def runDiagnostics(self) -> None:
         if self._testing:
@@ -433,4 +477,8 @@ class RelayViewModel(QObject):
     def close(self) -> None:
         self._closing = True
         self.timer.stop()
+        try:
+            self.service.disable_game_mode()
+        except Exception:
+            pass
         self._executor.shutdown(wait=False, cancel_futures=True)

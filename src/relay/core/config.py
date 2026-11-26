@@ -10,6 +10,7 @@ from typing import Iterable
 
 RELAY_PORT = 11893
 TUNNEL_PORT = 11894
+GAME_CONTROL_PORT = 11895
 LEGACY_PORTS: tuple[int, ...] = (11888, 11889, 11890, 11891, 11892)
 ALL_MANAGED_PORTS: tuple[int, ...] = (*LEGACY_PORTS, RELAY_PORT)
 
@@ -23,6 +24,12 @@ DEFAULT_FORCE_DOMAINS: tuple[str, ...] = (
     "rbxcdn.com",
     "wattpad.com",
     "pastebin.com",
+)
+
+DEFAULT_GAME_APPS: tuple[str, ...] = (
+    "RobloxPlayerBeta.exe",
+    "RobloxStudioBeta.exe",
+    "Discord.exe",
 )
 
 # Major unblocked high-bandwidth services kept direct in Strict (Tünel) mode
@@ -162,6 +169,31 @@ def _clean_domain_list(items: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(cleaned))
 
 
+def sanitize_app_name(raw: str) -> str:
+    """Normalize a user-entered process/executable name (e.g. 'RobloxPlayerBeta.exe')."""
+    text = (raw or "").strip().strip('"').strip("'")
+    if not text:
+        return ""
+    if "\\" in text or "/" in text:
+        text = text.replace("/", "\\").rsplit("\\", 1)[-1]
+    if any(ch.isspace() for ch in text):
+        return ""
+    if any(ch in text for ch in ('"', "'", ";", "(", ")", "{", "}", "|", "<", ">", "*", "?")):
+        return ""
+    if not text.lower().endswith(".exe"):
+        text = text + ".exe"
+    return text if len(text) > 4 else ""
+
+
+def _clean_app_list(items: Iterable[str]) -> tuple[str, ...]:
+    seen: dict[str, str] = {}
+    for item in items:
+        clean = sanitize_app_name(item)
+        if clean:
+            seen.setdefault(clean.lower(), clean)
+    return tuple(sorted(seen.values(), key=str.lower))
+
+
 @dataclass(frozen=True)
 class RelayConfig:
     mode: NetworkMode = NetworkMode.AUTO
@@ -171,6 +203,7 @@ class RelayConfig:
     start_with_windows: bool = False
     bypass_domains: tuple[str, ...] = field(default_factory=tuple)
     force_fragment_domains: tuple[str, ...] = field(default_factory=lambda: tuple(sorted(DEFAULT_FORCE_DOMAINS)))
+    game_mode_apps: tuple[str, ...] = field(default_factory=lambda: _clean_app_list(DEFAULT_GAME_APPS))
 
     @property
     def preset(self) -> ModePreset:
@@ -188,6 +221,11 @@ class RelayConfig:
             if "force_fragment_domains" in kwargs
             else self.force_fragment_domains
         )
+        game_apps = (
+            _clean_app_list(kwargs["game_mode_apps"])
+            if "game_mode_apps" in kwargs
+            else self.game_mode_apps
+        )
         return RelayConfig(
             mode=mode,
             doh_enabled=bool(kwargs.get("doh_enabled", self.doh_enabled)),
@@ -196,6 +234,7 @@ class RelayConfig:
             start_with_windows=bool(kwargs.get("start_with_windows", self.start_with_windows)),
             bypass_domains=bypass,
             force_fragment_domains=force,
+            game_mode_apps=game_apps,
         )
 
     def to_dict(self) -> dict:
@@ -207,6 +246,7 @@ class RelayConfig:
             "start_with_windows": self.start_with_windows,
             "bypass_domains": list(self.bypass_domains),
             "force_fragment_domains": list(self.force_fragment_domains),
+            "game_mode_apps": list(self.game_mode_apps),
         }
 
     @classmethod
@@ -229,6 +269,8 @@ class RelayConfig:
             updates["bypass_domains"] = data["bypass_domains"]
         if isinstance(data.get("force_fragment_domains"), list):
             updates["force_fragment_domains"] = data["force_fragment_domains"]
+        if isinstance(data.get("game_mode_apps"), list):
+            updates["game_mode_apps"] = data["game_mode_apps"]
         return defaults.with_updates(**updates)
 
 

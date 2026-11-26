@@ -9,6 +9,7 @@ from relay.core.config import RELAY_PORT, ConfigStore, RelayConfig, default_data
 from relay.platform.diagnostics import run_diagnostics
 from relay.platform.registry import ProxySettingsStore, WindowsProxyStore
 from relay.platform.worker import LocalWorkerManager, WorkerProcessManager
+from relay.proxy.gametunnel import GameTunnelClient
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,7 @@ class ServiceStatus:
     active_port: int | None
     ready: bool
     stats: dict | None
+    game_mode: bool = False
 
     @property
     def connected(self) -> bool:
@@ -31,11 +33,13 @@ class RelayService:
         proxy_store: ProxySettingsStore,
         worker_manager: WorkerProcessManager,
         port: int = RELAY_PORT,
+        game_tunnel: GameTunnelClient | None = None,
     ):
         self._lock = threading.Lock()
         self._config_store = config_store
         self._proxy_store = proxy_store
         self._worker_manager = worker_manager
+        self._game_tunnel = game_tunnel
         self.port = port
         self.config: RelayConfig = self._config_store.load()
 
@@ -109,6 +113,8 @@ class RelayService:
 
     def disable(self, *, stop_worker: bool = True) -> ServiceStatus:
         with self._lock:
+            if self._game_tunnel is not None:
+                self._game_tunnel.stop()
             current_port = self._proxy_store.active_port()
             if current_port is not None:
                 baseline = self._proxy_store.load_baseline()
@@ -121,13 +127,32 @@ class RelayService:
                     self._worker_manager.stop(self.port)
         return self.status()
 
+    def enable_game_mode(self) -> ServiceStatus:
+        """Start process-level split-tunnel (sing-box + wintun) for configured game/app executables."""
+        if self._game_tunnel is None:
+            raise RuntimeError("Oyun Modu bu oturumda etkin değil.")
+        st = self.status()
+        if not st.connected:
+            self.enable()
+        with self._lock:
+            self._game_tunnel.start(self.config.game_mode_apps)
+        return self.status()
+
+    def disable_game_mode(self) -> ServiceStatus:
+        """Cleanly terminate sing-box and destroy the ephemeral Wintun adapter."""
+        if self._game_tunnel is not None:
+            with self._lock:
+                self._game_tunnel.stop()
+        return self.status()
+
     def status(self) -> ServiceStatus:
         active_port = self._proxy_store.active_port()
+        gm = bool(self._game_tunnel is not None and self._game_tunnel.is_running())
         if active_port is None:
-            return ServiceStatus(active_port=None, ready=False, stats=None)
+            return ServiceStatus(active_port=None, ready=False, stats=None, game_mode=gm)
         stats = self._worker_manager.stats(active_port)
         ready = stats is not None or self._worker_manager.is_ready(active_port)
-        return ServiceStatus(active_port=active_port, ready=ready, stats=stats)
+        return ServiceStatus(active_port=active_port, ready=ready, stats=stats, game_mode=gm)
 
     def run_diagnostics(self) -> list[dict]:
         st = self.status()
@@ -141,4 +166,5 @@ def create_default_service(data_dir: Path | None = None) -> RelayService:
         proxy_store=WindowsProxyStore(base),
         worker_manager=LocalWorkerManager(base),
         port=RELAY_PORT,
+        game_tunnel=GameTunnelClient(base),
     )
