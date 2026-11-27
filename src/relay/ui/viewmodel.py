@@ -6,12 +6,15 @@ import ctypes
 from ctypes import wintypes
 import os
 from pathlib import Path
+import webbrowser
 
 from PySide6.QtCore import Property, QObject, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import QFileDialog
 
+from relay import __version__
 from relay.core.config import NetworkMode, sanitize_app_name, sanitize_domain
 from relay.platform.startup import is_startup_enabled, set_startup_enabled
+from relay.platform.updater import UpdateInfo, check_for_updates
 from relay.service.controller import RelayService, ServiceStatus
 
 
@@ -102,6 +105,7 @@ class RelayViewModel(QObject):
     changed = Signal()
     _actionCompleted = Signal(object, str)
     _diagnosticsCompleted = Signal(object)
+    _updateChecked = Signal(object)
 
     def __init__(self, service: RelayService):
         super().__init__()
@@ -119,14 +123,18 @@ class RelayViewModel(QObject):
         self._recovery_attempts = 0
         self._action_seq = 0
         self._start_with_windows = is_startup_enabled()
+        self._update_info: UpdateInfo | None = None
+        self._update_dismissed = False
 
         self._actionCompleted.connect(self._on_action_done, Qt.ConnectionType.QueuedConnection)
         self._diagnosticsCompleted.connect(self._on_diagnostics_done, Qt.ConnectionType.QueuedConnection)
+        self._updateChecked.connect(self._on_update_checked, Qt.ConnectionType.QueuedConnection)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
         self.timer.start(1000)
         QTimer.singleShot(0, self.poll)
+        QTimer.singleShot(2500, self.checkForUpdates)
 
     # --- Connection State ---
     @Property(bool, notify=changed)
@@ -548,6 +556,60 @@ class RelayViewModel(QObject):
             if kind == "action":
                 self._error = ""
         self.changed.emit()
+
+    # --- Updates ---
+    @Property(str, notify=changed)
+    def appVersion(self) -> str:
+        return __version__
+
+    @Property(bool, notify=changed)
+    def updateAvailable(self) -> bool:
+        return bool(self._update_info and self._update_info.available and not self._update_dismissed)
+
+    @Property(str, notify=changed)
+    def latestVersion(self) -> str:
+        return self._update_info.latest_version if self._update_info else ""
+
+    @Property(str, notify=changed)
+    def updateUrl(self) -> str:
+        return self._update_info.release_url if self._update_info else ""
+
+    @Slot()
+    def checkForUpdates(self) -> None:
+        if self._closing:
+            return
+        future = self._executor.submit(check_for_updates)
+
+        def _done(res):
+            if self._closing:
+                return
+            try:
+                info = res.result()
+            except Exception:
+                info = None
+            self._updateChecked.emit(info)
+
+        future.add_done_callback(_done)
+
+    @Slot()
+    def openUpdateUrl(self) -> None:
+        url = self.updateUrl
+        if url:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+    @Slot()
+    def dismissUpdate(self) -> None:
+        self._update_dismissed = True
+        self.changed.emit()
+
+    @Slot(object)
+    def _on_update_checked(self, info) -> None:
+        if isinstance(info, UpdateInfo) and info.available:
+            self._update_info = info
+            self.changed.emit()
 
     @Slot(object)
     def _on_diagnostics_done(self, results) -> None:

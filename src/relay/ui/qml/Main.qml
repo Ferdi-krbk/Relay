@@ -354,6 +354,72 @@ ApplicationWindow {
                 }
             }
 
+            // UPDATE AVAILABLE BANNER (auto-hidden unless newer GitHub release exists)
+            Rectangle {
+                visible: network.updateAvailable
+                Layout.fillWidth: true
+                Layout.leftMargin: 24
+                Layout.rightMargin: 24
+                Layout.topMargin: 8
+                Layout.preferredHeight: 34
+                radius: 10
+                antialiasing: true
+                color: theme.vermilionSoft
+                border.color: theme.vermilion
+                border.width: 1
+
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 12
+                    anchors.rightMargin: 8
+                    spacing: 8
+
+                    Rectangle {
+                        width: 7; height: 7; radius: 3.5; antialiasing: true
+                        color: theme.vermilion
+                    }
+                    BodyText {
+                        Layout.fillWidth: true
+                        text: "Yeni sürüm mevcut: v" + network.latestVersion + " (mevcut: v" + network.appVersion + ")"
+                        font.pixelSize: 11.5
+                        font.weight: Font.Medium
+                        color: theme.ink
+                        elide: Text.ElideRight
+                    }
+                    Rectangle {
+                        width: 66; height: 22; radius: 6; antialiasing: true
+                        color: updBtn.containsMouse ? "#C93D1E" : theme.vermilion
+                        BodyText {
+                            anchors.centerIn: parent
+                            text: "İndir ↗"
+                            font.pixelSize: 11
+                            font.weight: Font.Medium
+                            color: "#FDFCFA"
+                        }
+                        PressArea {
+                            id: updBtn
+                            anchors.fill: parent
+                            onInvoke: network.openUpdateUrl()
+                        }
+                    }
+                    Rectangle {
+                        width: 22; height: 22; radius: 6; antialiasing: true
+                        color: updClose.containsMouse ? theme.recess : "transparent"
+                        BodyText {
+                            anchors.centerIn: parent
+                            text: "×"
+                            font.pixelSize: 14
+                            color: theme.inkMuted
+                        }
+                        PressArea {
+                            id: updClose
+                            anchors.fill: parent
+                            onInvoke: network.dismissUpdate()
+                        }
+                    }
+                }
+            }
+
             // MODULAR STACKED VIEWS
             StackLayout {
                 id: tabStack

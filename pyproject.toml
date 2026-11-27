@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "relay-desktop"
-version = "2.0.0"
+version = "2.1.0"
 description = "High-throughput local HTTPS/WSS/HTTP smart DPI & DoH proxy with a Warm Ceramic Qt Quick desktop UI."
 readme = "README.md"
 requires-python = ">=3.11"
