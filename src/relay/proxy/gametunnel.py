@@ -642,6 +642,9 @@ def run_game_tunnel_supervisor(args) -> None:
                     self._send(503, {"ok": False})
 
             def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                if 0 < length <= 4096:
+                    self.rfile.read(length)
                 if self.path != "/stop":
                     self._send(404, {"ok": False})
                     return

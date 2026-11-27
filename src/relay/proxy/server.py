@@ -150,6 +150,16 @@ class ProxyServer:
             return True
         if self.mode == NetworkMode.STRICT and not domain_matches(hostname, STRICT_DIRECT_DOMAINS):
             return True
+        # Adaptive strict-network detection: once any domain on the current network
+        # required MASQUE (cleared automatically on Wi-Fi/IP change), route all
+        # force_fragment_domains straight to MASQUE with 0ms wait.
+        if (
+            self.mode == NetworkMode.AUTO
+            and self._tunnel_roots
+            and domain_matches(hostname, self.force_fragment_domains)
+            and not domain_matches(hostname, STRICT_DIRECT_DOMAINS)
+        ):
+            return True
         return False
 
     def _record_tunnel_host(self, hostname: str) -> None:
@@ -644,6 +654,7 @@ class ProxyServer:
                         return await self._open_tunnel(h, p)
 
                     tunnel_cb = _tracked_tunnel_open if self.tunnel_port is not None else None
+                    adaptive_tunnel_delay = 0.30 if len(self._tunnel_roots) >= 2 else 0.90
                     try:
                         if cached:
                             try:
@@ -673,6 +684,7 @@ class ProxyServer:
                                     force_fragment=force_frag,
                                     hello_timeout=hello_timeout,
                                     tunnel_connect=tunnel_cb,
+                                    tunnel_delay=adaptive_tunnel_delay,
                                 )
                                 if used_strategy == "tunnel":
                                     self._tunnel_failures = 0
@@ -701,6 +713,7 @@ class ProxyServer:
                                     force_fragment=force_frag,
                                     hello_timeout=hello_timeout,
                                     tunnel_connect=tunnel_cb,
+                                    tunnel_delay=adaptive_tunnel_delay,
                                 )
                             except (OSError, asyncio.TimeoutError):
                                 if not resolved_ip and self.resolver.enabled:
