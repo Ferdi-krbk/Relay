@@ -381,7 +381,7 @@ ApplicationWindow {
                     BodyText {
                         Layout.fillWidth: true
                         text: "Yeni sürüm mevcut: v" + network.latestVersion + " (mevcut: v" + network.appVersion + ")"
-                        font.pixelSize: 11.5
+                        font.pixelSize: 11
                         font.weight: Font.Medium
                         color: theme.ink
                         elide: Text.ElideRight
