@@ -318,7 +318,7 @@ def build_singbox_config(
                 "auto_route": True,
                 "strict_route": False,
                 "route_exclude_address": list(_TUN_EXCLUDE_CIDRS),
-                "stack": "mixed",
+                "stack": "gvisor",
             }
         ],
         "outbounds": [
