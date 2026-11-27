@@ -24,16 +24,56 @@ from relay.core.pac import generate_pac
 from relay.core.telemetry import ProxyTelemetry
 from relay.proxy.doh import DoHResolver
 from relay.proxy.dpi import StrategyCache, exchange_hello, race_client_hello, read_client_hello
-from relay.proxy.pipe import STREAM_LIMIT_BYTES, PipeProtocol, bridge_streams, open_upstream, tune_socket
+from relay.proxy.pipe import (
+    STREAM_LIMIT_BYTES,
+    PipeProtocol,
+    abort_writer,
+    bridge_streams,
+    open_upstream,
+    tune_socket,
+)
 from relay.proxy.tunnel import MasqueTunnel, open_socks5_upstream
 
 
+class _ClientAbortedError(Exception):
+    """Raised when the local client closes/resets its socket while upstream handshake is still in flight."""
+
+
+async def _run_until_client_aborts(
+    coro,
+    client_reader: asyncio.StreamReader,
+    client_writer: asyncio.StreamWriter,
+):
+    """Await `coro`, but immediately cancel it if the client socket disconnects mid-handshake."""
+    work_task = asyncio.create_task(coro)
+
+    async def _watch_client() -> None:
+        while not client_writer.is_closing() and not client_reader.at_eof():
+            await asyncio.sleep(0.04)
+
+    watch_task = asyncio.create_task(_watch_client())
+    try:
+        done, _ = await asyncio.wait({work_task, watch_task}, return_when=asyncio.FIRST_COMPLETED)
+        if work_task in done:
+            return work_task.result()
+        work_task.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait({work_task}, timeout=0.05)
+        raise _ClientAbortedError()
+    finally:
+        if not watch_task.done():
+            watch_task.cancel()
+
+
 def _detect_local_ip() -> str:
-    """Zero-packet kernel routing table lookup for the active outbound local IP."""
+    """Zero-packet kernel routing table lookup for the active physical outbound IP."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("1.1.1.1", 80))
-            return str(s.getsockname()[0])
+            ip = str(s.getsockname()[0])
+            if ip.startswith("127.") or ip.startswith("172.19."):
+                return ""
+            return ip
     except OSError:
         return ""
 
@@ -118,6 +158,23 @@ class ProxyServer:
         self.shutdown_event = asyncio.Event()
         self._server: asyncio.Server | None = None
         self._active_transports: set[asyncio.BaseTransport] = set()
+        self._bg_tasks: set[asyncio.Task] = set()
+
+    def _spawn_bg(self, coro) -> asyncio.Task | None:
+        try:
+            task = asyncio.create_task(coro)
+        except RuntimeError:
+            coro.close()
+            return None
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    def _cancel_bg_tasks(self) -> None:
+        for task in list(self._bg_tasks):
+            if not task.done():
+                task.cancel()
+        self._bg_tasks.clear()
 
     def _track_stream(self, stream: asyncio.StreamWriter | None) -> None:
         if stream is not None and stream.transport is not None:
@@ -197,7 +254,7 @@ class ProxyServer:
                 f"Relay MASQUE tunnel ready: socks5://{self._managed_tunnel.host}:{self._managed_tunnel.port}",
                 flush=True,
             )
-            asyncio.create_task(self._prewarm_tunnel())
+            self._spawn_bg(self._prewarm_tunnel())
 
     async def _restart_managed_tunnel(self) -> None:
         if self._managed_tunnel is None or self._tunnel_restarting:
@@ -214,7 +271,7 @@ class ProxyServer:
             self._tunnel_failures = 0
             self._first_tunnel_fail_ts = 0.0
             if ok:
-                asyncio.create_task(self._prewarm_tunnel())
+                self._spawn_bg(self._prewarm_tunnel())
         finally:
             self._tunnel_restarting = False
 
@@ -225,12 +282,11 @@ class ProxyServer:
         self._tunnel_failures += 1
         if self._managed_tunnel is None:
             return
-        # Never kill a healthy usque because 2 parallel Chrome sockets timed out on one slow origin;
-        # only restart if the SOCKS port died OR sustained failures lasted >= 8s with zero successes.
-        port_dead = not self._managed_tunnel.is_ready()
+        # Non-blocking check (`available` reads Popen.poll(), never blocks the asyncio loop).
+        proc_dead = not self._managed_tunnel.available
         sustained = self._tunnel_failures >= 6 and (now - self._first_tunnel_fail_ts) >= 8.0
-        if port_dead or sustained:
-            asyncio.create_task(self._restart_managed_tunnel())
+        if proc_dead or sustained:
+            self._spawn_bg(self._restart_managed_tunnel())
 
     async def _open_tunnel(self, hostname: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         if self.tunnel_port is None:
@@ -269,8 +325,7 @@ class ProxyServer:
             if not payload["doh_enabled"]:
                 self.resolver.close()
             elif not was_enabled and self.prewarm_doh:
-                with contextlib.suppress(RuntimeError):
-                    asyncio.create_task(self.resolver.prewarm())
+                self._spawn_bg(self.resolver.prewarm())
         if isinstance(payload.get("bypass_domains"), list):
             self.bypass_domains = tuple(
                 sorted({str(d).lower().strip(".") for d in payload["bypass_domains"] if str(d).strip()})
@@ -301,16 +356,17 @@ class ProxyServer:
             if wall_drift > 15.0 or (cur_ip and last_ip and cur_ip != last_ip):
                 self.flush_caches(clear_persisted=False)
                 if self.prewarm_doh and self.resolver.enabled:
-                    asyncio.create_task(self.resolver.prewarm())
+                    self._spawn_bg(self.resolver.prewarm())
                 if self._managed_tunnel is not None:
-                    asyncio.create_task(self._restart_managed_tunnel())
+                    self._spawn_bg(self._restart_managed_tunnel())
             if (
                 self._managed_tunnel is not None
                 and not self._managed_tunnel.available
-                and not self._managed_tunnel.is_ready()
+                and not await asyncio.to_thread(self._managed_tunnel.is_ready)
             ):
                 if await asyncio.to_thread(self._managed_tunnel.start):
                     self.tunnel_port = self._managed_tunnel.port
+                    self._spawn_bg(self._prewarm_tunnel())
             if cur_ip:
                 last_ip = cur_ip
             last_mono = now_mono
@@ -363,12 +419,14 @@ class ProxyServer:
                     bg.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await bg
+            self._cancel_bg_tasks()
             if self._managed_tunnel is not None:
                 self._managed_tunnel.stop()
             self.resolver.close()
 
     async def stop(self) -> None:
         self.shutdown_event.set()
+        self._cancel_bg_tasks()
         if self._server is not None:
             self._server.close()
             if hasattr(self._server, "close_clients"):
@@ -662,18 +720,28 @@ class ProxyServer:
 
             hello, is_tls = await read_client_hello(reader)
             if is_tls:
-                if via_tunnel:
-                    try:
-                        upstream_reader, upstream, first_response = await exchange_hello(
-                            upstream_reader, upstream, hello, hostname, 0.0, "direct", timeout=6.0
-                        )
-                        self._tunnel_failures = 0
-                    except (OSError, asyncio.TimeoutError):
-                        self._on_tunnel_failure()
-                        raise
-                    used_strategy = "tunnel"
-                else:
-                    used_strategy = cached or "direct"
+                async def _complete_tls_handshake():
+                    nonlocal upstream_reader, upstream, resolved_ip, target_host
+                    if via_tunnel:
+                        try:
+                            u_r, u_w, f_resp = await exchange_hello(
+                                upstream_reader, upstream, hello, hostname, 0.0, "direct", timeout=7.5
+                            )
+                            self._tunnel_failures = 0
+                        except (OSError, asyncio.TimeoutError):
+                            # Transparently retry once on a fresh MASQUE stream in case an idle HTTP/2 stream closed.
+                            upstream_reader, upstream = await self._open_tunnel(hostname, port)
+                            try:
+                                u_r, u_w, f_resp = await exchange_hello(
+                                    upstream_reader, upstream, hello, hostname, 0.0, "direct", timeout=7.5
+                                )
+                                self._tunnel_failures = 0
+                            except (OSError, asyncio.TimeoutError):
+                                self._on_tunnel_failure()
+                                raise
+                        return u_r, u_w, f_resp, "tunnel"
+
+                    u_strat = cached or "direct"
                     tunnel_tried = False
 
                     async def _tracked_tunnel_open(h: str = hostname, p: int = port):
@@ -686,7 +754,7 @@ class ProxyServer:
                     try:
                         if cached:
                             try:
-                                upstream_reader, upstream, first_response = await exchange_hello(
+                                u_r, u_w, f_resp = await exchange_hello(
                                     upstream_reader, upstream, hello, hostname, self.delay, cached, timeout=hello_timeout
                                 )
                             except (OSError, asyncio.TimeoutError):
@@ -698,7 +766,7 @@ class ProxyServer:
                                 upstream_reader, upstream = await open_upstream(
                                     target_host, port, timeout=connect_timeout
                                 )
-                                (upstream_reader, upstream, first_response), used_strategy = await race_client_hello(
+                                (u_r, u_w, f_resp), u_strat = await race_client_hello(
                                     upstream_reader,
                                     upstream,
                                     hello,
@@ -714,20 +782,20 @@ class ProxyServer:
                                     tunnel_connect=tunnel_cb,
                                     tunnel_delay=adaptive_tunnel_delay,
                                 )
-                                if used_strategy == "tunnel":
+                                if u_strat == "tunnel":
                                     self._tunnel_failures = 0
                                     self._record_tunnel_host(hostname)
                                 else:
-                                    if resolved_ip and used_strategy != "direct":
+                                    if resolved_ip and u_strat != "direct":
                                         self._doh_hosts.add(hostname)
                                     self.strategies.set(
                                         hostname,
-                                        used_strategy,
-                                        persist=(used_strategy != "direct"),
+                                        u_strat,
+                                        persist=(u_strat != "direct"),
                                     )
                         else:
                             try:
-                                (upstream_reader, upstream, first_response), used_strategy = await race_client_hello(
+                                (u_r, u_w, f_resp), u_strat = await race_client_hello(
                                     upstream_reader,
                                     upstream,
                                     hello,
@@ -751,7 +819,7 @@ class ProxyServer:
                                         upstream_reader, upstream = await open_upstream(
                                             target_host, port, timeout=connect_timeout
                                         )
-                                        (upstream_reader, upstream, first_response), used_strategy = (
+                                        (u_r, u_w, f_resp), u_strat = (
                                             await race_client_hello(
                                                 upstream_reader,
                                                 upstream,
@@ -766,6 +834,7 @@ class ProxyServer:
                                                 force_fragment=True,
                                                 hello_timeout=hello_timeout,
                                                 tunnel_connect=None if tunnel_tried else tunnel_cb,
+                                                tunnel_delay=adaptive_tunnel_delay,
                                             )
                                         )
                                         self._doh_hosts.add(hostname)
@@ -773,15 +842,15 @@ class ProxyServer:
                                         raise
                                 else:
                                     raise
-                            if used_strategy == "tunnel":
+                            if u_strat == "tunnel":
                                 self._tunnel_failures = 0
                                 self._record_tunnel_host(hostname)
                             else:
                                 self.strategies.set(
                                     hostname,
-                                    used_strategy,
+                                    u_strat,
                                     persist=(
-                                        used_strategy != "direct"
+                                        u_strat != "direct"
                                         and (force_frag or hostname in self._doh_hosts)
                                     ),
                                 )
@@ -792,15 +861,20 @@ class ProxyServer:
                             raise
                         upstream_reader, upstream = await self._open_tunnel(hostname, port)
                         try:
-                            upstream_reader, upstream, first_response = await exchange_hello(
-                                upstream_reader, upstream, hello, hostname, 0.0, "direct", timeout=6.0
+                            u_r, u_w, f_resp = await exchange_hello(
+                                upstream_reader, upstream, hello, hostname, 0.0, "direct", timeout=7.5
                             )
                             self._tunnel_failures = 0
                         except (OSError, asyncio.TimeoutError):
                             self._on_tunnel_failure()
                             raise
-                        used_strategy = "tunnel"
+                        u_strat = "tunnel"
                         self._record_tunnel_host(hostname)
+                    return u_r, u_w, f_resp, u_strat
+
+                upstream_reader, upstream, first_response, used_strategy = await _run_until_client_aborts(
+                    _complete_tls_handshake(), reader, writer
+                )
 
                 latency_ms = int((time.monotonic() - started) * 1000)
                 note = "MASQUE" if used_strategy == "tunnel" else ("DoH" if resolved_ip else "")
@@ -845,6 +919,9 @@ class ProxyServer:
                 # Firewall allowed ServerHello then blackholed post-handshake traffic;
                 # close promptly so the browser retries directly over MASQUE.
                 self._record_tunnel_host(hostname)
+        except _ClientAbortedError:
+            abort_writer(upstream)
+            abort_writer(writer)
         except (
             OSError,
             ValueError,

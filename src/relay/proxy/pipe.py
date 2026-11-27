@@ -12,6 +12,18 @@ STREAM_LIMIT_BYTES = 2 * 1024 * 1024    # 2 MB StreamReader limit
 WRITE_LOW_WATER = 1 * 1024 * 1024       # 1 MB low-water flow control
 
 
+def abort_writer(writer: asyncio.StreamWriter | None) -> None:
+    """Immediately tear down a failed/cancelled StreamWriter without waiting for TCP FIN drain."""
+    if writer is None:
+        return
+    tr = writer.transport
+    if tr is not None:
+        with contextlib.suppress(Exception):
+            tr.abort()
+    with contextlib.suppress(Exception):
+        writer.close()
+
+
 def tune_socket(writer: asyncio.StreamWriter) -> None:
     """Configure low-latency and 1 Gbps+ throughput socket options."""
     transport = writer.transport
@@ -35,10 +47,20 @@ async def open_upstream(
     port: int,
     timeout: float = 8.0,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(target_host, port, limit=STREAM_LIMIT_BYTES),
-        timeout=timeout,
+    conn_task = asyncio.create_task(
+        asyncio.open_connection(target_host, port, limit=STREAM_LIMIT_BYTES)
     )
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.shield(conn_task), timeout=timeout)
+    except BaseException:
+        if not conn_task.done():
+            conn_task.cancel()
+            conn_task.add_done_callback(
+                lambda t: abort_writer(t.result()[1]) if not t.cancelled() and t.exception() is None else None
+            )
+        elif conn_task.exception() is None:
+            abort_writer(conn_task.result()[1])
+        raise
     tune_socket(writer)
     return reader, writer
 
@@ -194,6 +216,15 @@ async def bridge_streams(
         return False
     try:
         await done
+    except BaseException:
+        with contextlib.suppress(Exception):
+            u_tr.abort()
+        with contextlib.suppress(Exception):
+            c_tr.abort()
+        raise
     finally:
         _cancel_stall_timer()
+        if stalled:
+            with contextlib.suppress(Exception):
+                u_tr.abort()
     return stalled

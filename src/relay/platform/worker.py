@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ import time
 from typing import Protocol
 from urllib.request import ProxyHandler, Request, build_opener
 
-from relay.core.config import RelayConfig, default_data_dir
+from relay.core.config import TUNNEL_PORT, RelayConfig, default_data_dir
 
 
 class WorkerProcessManager(Protocol):
@@ -27,6 +28,31 @@ class WorkerProcessManager(Protocol):
 
 def _direct_opener():
     return build_opener(ProxyHandler({}))
+
+
+def _wait_for_pid_exit(pid: int | None, timeout: float = 1.2) -> bool:
+    """Return True once OS process `pid` has exited, or False if still alive after `timeout`."""
+    if not isinstance(pid, int) or pid <= 0:
+        return True
+    if os.name != "nt":
+        return True
+    SYNCHRONIZE = 0x00100000
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000
+    WAIT_OBJECT_0 = 0x00000000
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+    if not handle:
+        return True
+    try:
+        res = kernel.WaitForSingleObject(handle, max(0, int(timeout * 1000)))
+        return res == WAIT_OBJECT_0
+    finally:
+        kernel.CloseHandle(handle)
 
 
 class LocalWorkerManager:
@@ -105,39 +131,45 @@ class LocalWorkerManager:
     def stop(self, port: int) -> None:
         tracked = self._processes.pop(port, None)
         health = self.health(port)
-        if health is None and (tracked is None or tracked.poll() is not None):
-            return
         pid = health.get("pid") if isinstance(health, dict) else None
 
-        # 1. Request clean graceful shutdown via POST /shutdown.
+        # 1. Request clean graceful shutdown via POST /shutdown and verify the worker PID actually exits.
         if health is not None:
             self._control_post(port, "/shutdown", timeout=0.5)
-
             for _ in range(15):
                 if not self.is_ready(port):
-                    return
+                    break
                 time.sleep(0.08)
+            if not self.is_ready(port) and _wait_for_pid_exit(pid, timeout=1.0):
+                if tracked is None or tracked.poll() is not None or _wait_for_pid_exit(tracked.pid, timeout=0.4):
+                    return
 
-        # 2. Fallback: force-terminate tracked or port-owning PID (handles orphaned legacy workers).
+        # 2. Fallback: force-terminate tracked, health-reported, or port-owning PIDs (plus orphaned tunnel).
         pids: set[int] = set()
         if tracked and tracked.poll() is None:
             pids.add(tracked.pid)
-        if isinstance(pid, int) and pid > 0:
+        if isinstance(pid, int) and pid > 0 and not _wait_for_pid_exit(pid, timeout=0.0):
             pids.add(pid)
-        if not pids:
-            with contextlib.suppress(Exception):
-                out = subprocess.check_output(
-                    ["netstat", "-ano", "-p", "TCP"],
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                    timeout=3,
-                    text=True,
-                )
-                target = f"127.0.0.1:{port}"
-                for line in out.splitlines():
-                    if target in line and "LISTENING" in line:
-                        parts = line.split()
-                        if parts and parts[-1].isdigit():
-                            pids.add(int(parts[-1]))
+        with contextlib.suppress(Exception):
+            out = subprocess.check_output(
+                ["netstat", "-ano", "-p", "TCP"],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=3,
+                text=True,
+            )
+            targets = {f"127.0.0.1:{port}", f"127.0.0.1:{TUNNEL_PORT}"}
+            for line in out.splitlines():
+                parts = line.split()
+                # Match strictly on listening Local Address (parts[1]) so client sockets (e.g. browsers) are never touched.
+                if (
+                    len(parts) >= 5
+                    and parts[1] in targets
+                    and parts[2] in ("0.0.0.0:0", "*:*", "[::]:0")
+                    and parts[-1].isdigit()
+                ):
+                    cand = int(parts[-1])
+                    if cand > 0 and cand != os.getpid():
+                        pids.add(cand)
 
         taskkill = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe")
         for target_pid in pids:

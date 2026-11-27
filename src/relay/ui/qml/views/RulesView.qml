@@ -16,6 +16,42 @@ ScrollView {
         Item { Layout.preferredHeight: 6 }
 
         Rectangle {
+            visible: network.error.length > 0
+            Layout.fillWidth: true
+            Layout.leftMargin: 26
+            Layout.rightMargin: 26
+            implicitHeight: errRow.implicitHeight + 16
+            radius: 10
+            antialiasing: true
+            color: root.theme.vermilionSoft
+            border.color: root.theme.vermilion
+
+            RowLayout {
+                id: errRow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: 12
+                anchors.rightMargin: 8
+                spacing: 8
+
+                BodyText {
+                    Layout.fillWidth: true
+                    text: network.error
+                    font.pixelSize: 11
+                    color: root.theme.vermilion
+                    wrapMode: Text.WordWrap
+                }
+                Rectangle {
+                    width: 22; height: 22; radius: 6; antialiasing: true
+                    color: errClose.containsMouse ? root.theme.recess : "transparent"
+                    BodyText { anchors.centerIn: parent; text: "×"; font.pixelSize: 13; color: root.theme.vermilion }
+                    PressArea { id: errClose; anchors.fill: parent; onInvoke: network.clearError() }
+                }
+            }
+        }
+
+        Rectangle {
             Layout.fillWidth: true
             Layout.leftMargin: 26
             Layout.rightMargin: 26
@@ -63,7 +99,7 @@ ScrollView {
                         BodyText { width: parent.width; text: "Oyun / Uygulama Modu (Split-TUN)"; font.weight: Font.Medium; color: root.theme.ink }
                         BodyText { width: parent.width; wrapMode: Text.WordWrap; text: "Sadece aşağıdaki listedeki oyun/uygulamaları (Roblox vb.) MASQUE tüneline yönlendirir; diğer trafik direkt kalır. Yönetici izni ister."; font.pixelSize: 11; color: root.theme.inkMuted }
                     }
-                    CeramicSwitch { checked: network.gameModeActive; onToggled: function(v) { network.setGameMode(v) } }
+                    CeramicSwitch { checked: network.gameModeActive; switchEnabled: !network.busy; onToggled: function(v) { network.setGameMode(v) } }
                 }
                 Rectangle { width: parent.width; height: 1; color: root.theme.hairline }
                 RowLayout {

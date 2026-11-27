@@ -321,3 +321,109 @@ def test_service_hot_reload_and_watchdog_recovery(tmp_path: Path):
         pass
     assert store.restored is True
     assert store.active_port() is None
+
+
+def test_shutdown_with_idle_open_connect_tunnel_does_not_hang():
+    """Regression: open keep-alive CONNECT tunnels using PipeProtocol must not hang shutdown."""
+
+    async def _run():
+        hold = asyncio.Event()
+
+        async def _upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+            try:
+                await hold.wait()
+            finally:
+                writer.close()
+
+        up_srv = await asyncio.start_server(_upstream, "127.0.0.1", 0)
+        up_port = up_srv.sockets[0].getsockname()[1]
+
+        proxy = ProxyServer(port=0, mode=NetworkMode.AUTO, doh_enabled=False, prewarm_doh=False)
+        await proxy.start()
+        p_port = proxy.bound_port
+        serve_task = asyncio.create_task(proxy.serve())
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", p_port)
+        try:
+            writer.write(f"CONNECT 127.0.0.1:{up_port} HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\n\r\n".encode())
+            await writer.drain()
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2.0)
+            assert b"200 Connection Established" in head
+            await asyncio.sleep(0.05)
+
+            # Stop proxy while client + upstream keep-alive sockets are still open and idle.
+            await asyncio.wait_for(proxy.stop(), timeout=1.5)
+            await asyncio.wait_for(serve_task, timeout=1.5)
+        finally:
+            hold.set()
+            writer.close()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    asyncio.run(_run())
+
+
+def test_windows_proxy_store_restores_clean_wininet_per_connection(tmp_path: Path, monkeypatch):
+    import winreg
+    from relay.platform import registry
+
+    per_conn_calls = []
+    monkeypatch.setattr(
+        registry,
+        "_apply_wininet_per_connection",
+        lambda **kw: per_conn_calls.append(kw),
+    )
+    monkeypatch.setattr(registry, "notify_windows_network_changed", lambda: None)
+
+    fake_reg: dict[str, tuple[object, int]] = {}
+
+    class DummyKey:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(winreg, "OpenKey", lambda *a, **kw: DummyKey())
+
+    def _set_val(_k, name, _res, kind, val):
+        fake_reg[name] = (val, kind)
+
+    def _del_val(_k, name):
+        if name not in fake_reg:
+            raise FileNotFoundError(name)
+        fake_reg.pop(name)
+
+    def _query_val(_k, name):
+        if name not in fake_reg:
+            raise FileNotFoundError(name)
+        return fake_reg[name]
+
+    monkeypatch.setattr(winreg, "SetValueEx", _set_val)
+    monkeypatch.setattr(winreg, "DeleteValue", _del_val)
+    monkeypatch.setattr(winreg, "QueryValueEx", _query_val)
+
+    store = registry.WindowsProxyStore(tmp_path)
+    store.apply_proxy(11893, system_proxy=True)
+    assert per_conn_calls[-1] == {
+        "flags": registry.PROXY_TYPE_DIRECT | registry.PROXY_TYPE_PROXY,
+        "proxy_server": "127.0.0.1:11893",
+        "proxy_bypass": registry.PROXY_OVERRIDE,
+        "autoconfig_url": "",
+    }
+
+    # Even if baseline accidentally had a stale Relay PAC URL, restore_baseline must strip it and reset to DIRECT.
+    dirty_baseline = [
+        {"Name": "ProxyEnable", "Exists": True, "Value": 0, "Kind": winreg.REG_DWORD},
+        {"Name": "AutoConfigURL", "Exists": True, "Value": "http://127.0.0.1:11893/proxy.pac", "Kind": winreg.REG_SZ},
+        {"Name": "ProxyServer", "Exists": False},
+        {"Name": "ProxyOverride", "Exists": False},
+    ]
+    store.restore_baseline(dirty_baseline)
+    assert "AutoConfigURL" not in fake_reg
+    assert per_conn_calls[-1] == {
+        "flags": registry.PROXY_TYPE_DIRECT,
+        "proxy_server": "",
+        "proxy_bypass": "",
+        "autoconfig_url": "",
+    }

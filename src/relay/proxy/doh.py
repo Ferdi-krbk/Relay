@@ -11,6 +11,8 @@ import time
 from typing import Iterable
 from urllib.parse import quote
 
+from relay.proxy.pipe import abort_writer
+
 # Direct-IP endpoints prevent ISP DNS poisoning from blocking DoH bootstrap itself.
 DOH_ENDPOINTS: tuple[tuple[str, int, str, str], ...] = (
     ("1.1.1.1", 443, "cloudflare-dns.com", "/dns-query?name={name}&type=A"),
@@ -53,7 +55,7 @@ class DoHResolver:
         self.max_pool = max_pool
         self.max_entries = max_entries
         self._cache: dict[str, tuple[str | None, float]] = {}
-        self._inflight: dict[str, asyncio.Future[str | None]] = {}
+        self._inflight: dict[str, asyncio.Task[str | None]] = {}
         self._pool: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
         self._ssl_context = ssl.create_default_context()
         self._consecutive_failures = 0
@@ -110,43 +112,47 @@ class DoHResolver:
             self.fallbacks += 1
             return None
 
-        existing = self._inflight.get(key)
-        if existing is not None:
-            return await existing
+        task = self._inflight.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(self._resolve_uncached(key))
+            self._inflight[key] = task
+            task.add_done_callback(
+                lambda done_t, k=key: self._inflight.pop(k, None) if self._inflight.get(k) is done_t else None
+            )
+        return await asyncio.shield(task)
 
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[str | None] = loop.create_future()
-        self._inflight[key] = future
+    async def _resolve_uncached(self, key: str) -> str | None:
+        now = time.monotonic()
         try:
             ip, ttl, reached = await self._query_doh(key)
+            now = time.monotonic()
             if ip:
                 self._consecutive_failures = 0
                 self._cache_set(key, ip, now + max(60.0, min(float(ttl), 600.0)))
                 self.hits += 1
-                future.set_result(ip)
                 return ip
             if reached:
                 # Valid DoH response with no IPv4 A record (NXDOMAIN / NODATA / IPv6-only).
                 # Do NOT trip the circuit breaker; negative-cache briefly instead.
                 self._consecutive_failures = 0
                 self._cache_set(key, None, now + max(30.0, min(float(ttl or 60), 120.0)))
-                future.set_result(None)
                 return None
             self._record_failure()
-            future.set_result(None)
             return None
+        except asyncio.CancelledError:
+            raise
         except Exception:
             self._record_failure()
-            if not future.done():
-                future.set_result(None)
             return None
-        finally:
-            self._inflight.pop(key, None)
 
     def close(self) -> None:
+        for task in list(self._inflight.values()):
+            if not task.done():
+                task.cancel()
+        self._inflight.clear()
         while self._pool:
             _, writer = self._pool.pop()
-            writer.close()
+            abort_writer(writer)
 
     def _record_failure(self) -> None:
         self._consecutive_failures += 1
@@ -253,9 +259,13 @@ class DoHResolver:
                 if valid:
                     return ip, ttl, True
                 break
+            except asyncio.CancelledError:
+                if writer is not None:
+                    abort_writer(writer)
+                raise
             except Exception:
                 if writer is not None:
-                    writer.close()
+                    abort_writer(writer)
                 continue
 
         for server_ip, server_port, sni_host, path_tpl in DOH_ENDPOINTS[1:]:
@@ -285,11 +295,11 @@ class DoHResolver:
                 ip, ttl, valid = self._extract_a_record(body)
                 if valid:
                     return ip, ttl, True
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 continue
             finally:
                 if writer is not None:
-                    writer.close()
-                    with contextlib.suppress(OSError):
-                        await writer.wait_closed()
+                    abort_writer(writer)
         return None, 0, False

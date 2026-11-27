@@ -442,6 +442,12 @@ class RelayViewModel(QObject):
         self.service.update_config(force_fragment_domains=updated)
         self._reapply_if_connected()
 
+    @Slot()
+    def clearError(self) -> None:
+        if self._error:
+            self._error = ""
+            self.changed.emit()
+
     @Slot(bool)
     def setGameMode(self, enabled: bool) -> None:
         if self._busy:
@@ -449,6 +455,7 @@ class RelayViewModel(QObject):
         want = bool(enabled)
         if want == self.gameModeActive:
             return
+        self._disconnecting = False
         self._busy = True
         self._error = ""
         self.changed.emit()
@@ -461,6 +468,7 @@ class RelayViewModel(QObject):
             return
         self.service.update_config(game_mode_apps=(*self.service.config.game_mode_apps, app_name))
         if self.gameModeActive and not self._busy:
+            self._disconnecting = False
             self._busy = True
             self.changed.emit()
             self._dispatch("action", self.service.enable_game_mode)
@@ -484,6 +492,7 @@ class RelayViewModel(QObject):
         updated = tuple(a for a in self.service.config.game_mode_apps if a.lower() != app_name.lower())
         self.service.update_config(game_mode_apps=updated)
         if self.gameModeActive and not self._busy:
+            self._disconnecting = False
             self._busy = True
             self.changed.emit()
             self._dispatch("action", self.service.enable_game_mode)

@@ -147,9 +147,12 @@ class Socks5UdpShim:
                 if not data:
                     break
                 writer.write(data)
-                await writer.drain()
-        except Exception:
-            pass
+                await asyncio.wait_for(writer.drain(), timeout=10.0)
+        except BaseException:
+            tr = writer.transport
+            if tr is not None:
+                with contextlib.suppress(Exception):
+                    tr.abort()
         finally:
             with contextlib.suppress(Exception):
                 writer.close()
@@ -263,8 +266,11 @@ class Socks5UdpShim:
             done, pending = await asyncio.wait({c_wait, u_wait}, return_when=asyncio.FIRST_COMPLETED)
             for p in pending:
                 p.cancel()
-        except Exception:
-            pass
+        except BaseException:
+            for w in (up_writer, writer):
+                if w is not None and w.transport is not None:
+                    with contextlib.suppress(Exception):
+                        w.transport.abort()
         finally:
             for tr in (client_udp_tr, up_udp_tr):
                 if tr is not None:
@@ -691,7 +697,7 @@ def run_game_tunnel_supervisor(args) -> None:
                     break
                 if parent_pid > 0 and not _is_pid_alive(parent_pid):
                     break
-                time.sleep(0.5)
+                stop_event.wait(0.25)
         finally:
             httpd.shutdown()
             httpd.server_close()

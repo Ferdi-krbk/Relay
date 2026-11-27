@@ -11,10 +11,11 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 from relay.core.config import TUNNEL_PORT, default_data_dir
-from relay.proxy.pipe import STREAM_LIMIT_BYTES, tune_socket
+from relay.proxy.pipe import STREAM_LIMIT_BYTES, abort_writer, open_upstream
 
 
 async def open_socks5_upstream(
@@ -25,12 +26,8 @@ async def open_socks5_upstream(
     timeout: float = 6.0,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """Open a TCP stream to (target_host, target_port) through a local RFC 1928 SOCKS5 proxy."""
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(socks_host, socks_port, limit=STREAM_LIMIT_BYTES),
-        timeout=timeout,
-    )
+    reader, writer = await open_upstream(socks_host, socks_port, timeout=timeout)
     try:
-        tune_socket(writer)
 
         # 1. Greeting: VER=5, NMETHODS=1, METHOD=0x00 (No Auth)
         writer.write(b"\x05\x01\x00")
@@ -75,9 +72,7 @@ async def open_socks5_upstream(
 
         return reader, writer
     except BaseException:
-        writer.close()
-        with contextlib.suppress(OSError):
-            await writer.wait_closed()
+        abort_writer(writer)
         raise
 
 
@@ -133,6 +128,7 @@ class MasqueTunnel:
         self.config_path = self.data_dir / "usque-config.json"
         self.log_path = self.data_dir / ("usque.log" if port == TUNNEL_PORT else f"usque-{port}.log")
         self._process: subprocess.Popen | None = None
+        self._lock = threading.Lock()
 
     @property
     def available(self) -> bool:
@@ -160,99 +156,107 @@ class MasqueTunnel:
 
     def start(self) -> bool:
         """Start usque socks bound strictly to 127.0.0.1. Returns True if ready."""
-        if self.is_ready():
-            return True
-
-        binary = resolve_usque_binary(self.data_dir)
-        if binary is None:
-            return False
-
-        if not self._ensure_registered(binary):
-            return False
-
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            if self.log_path.is_file() and self.log_path.stat().st_size > 524_288:
-                self.log_path.write_text("", encoding="utf-8")
-
-        cmd = [
-            str(binary),
-            "-c",
-            str(self.config_path),
-            "socks",
-            "-b",
-            self.host,
-            "-p",
-            str(self.port),
-            "--http2",
-            "-s",
-            "cloudflare.com",
-            "--always-reconnect",
-            "-k",
-            "10s",
-            "-d",
-            "1.1.1.1",
-            "-d",
-            "8.8.8.8",
-        ]
-        try:
-            with self.log_path.open("a", encoding="utf-8") as log_file:
-                self._process = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_file,
-                    stderr=log_file,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-        except OSError:
-            self._process = None
-            return False
-
-        for _ in range(30):
+        with self._lock:
             if self.is_ready():
                 return True
-            proc = self._process
-            if proc is None or proc.poll() is not None:
+
+            binary = resolve_usque_binary(self.data_dir)
+            if binary is None:
+                return False
+
+            if not self._ensure_registered(binary):
+                return False
+
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(OSError):
+                if self.log_path.is_file() and self.log_path.stat().st_size > 524_288:
+                    self.log_path.write_text("", encoding="utf-8")
+
+            cmd = [
+                str(binary),
+                "-c",
+                str(self.config_path),
+                "socks",
+                "-b",
+                self.host,
+                "-p",
+                str(self.port),
+                "--http2",
+                "-s",
+                "cloudflare.com",
+                "--always-reconnect",
+                "-k",
+                "10s",
+                "-d",
+                "1.1.1.1",
+                "-d",
+                "8.8.8.8",
+            ]
+            try:
+                with self.log_path.open("a", encoding="utf-8") as log_file:
+                    self._process = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log_file,
+                        stderr=log_file,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+            except OSError:
                 self._process = None
                 return False
-            time.sleep(0.15)
-        return self.is_ready()
+
+            proc = self._process
+            for _ in range(30):
+                if self.is_ready():
+                    return True
+                if proc is None or proc.poll() is not None:
+                    self._process = None
+                    return False
+                time.sleep(0.15)
+            return self.is_ready()
 
     def stop(self) -> None:
-        proc = self._process
-        self._process = None
-        if proc is not None and proc.poll() is None:
-            with contextlib.suppress(OSError):
-                proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
+        with self._lock:
+            proc = self._process
+            self._process = None
+            if proc is not None and proc.poll() is None:
                 with contextlib.suppress(OSError):
-                    proc.kill()
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(OSError):
+                        proc.kill()
 
-        # Also clean up any orphaned usque listener on self.port if _process wasn't tracked.
-        if self.is_ready():
-            pids: set[int] = set()
-            with contextlib.suppress(Exception):
-                out = subprocess.check_output(
-                    ["netstat", "-ano", "-p", "TCP"],
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    timeout=3,
-                    text=True,
-                )
-                target = f"{self.host}:{self.port}"
-                for line in out.splitlines():
-                    if target in line and "LISTENING" in line:
-                        parts = line.split()
-                        if parts and parts[-1].isdigit():
-                            pids.add(int(parts[-1]))
-            taskkill = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe")
-            for pid in pids:
+            # Locale-independent cleanup of any orphaned usque listener bound strictly to self.host:self.port.
+            if self.is_ready():
+                pids: set[int] = set()
                 with contextlib.suppress(Exception):
-                    subprocess.run(
-                        [taskkill, "/PID", str(pid), "/T", "/F"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
+                    out = subprocess.check_output(
+                        ["netstat", "-ano", "-p", "TCP"],
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                        timeout=5,
+                        timeout=3,
+                        text=True,
                     )
+                    target = f"{self.host}:{self.port}"
+                    for line in out.splitlines():
+                        parts = line.split()
+                        if (
+                            len(parts) >= 5
+                            and parts[1] == target
+                            and parts[2] in ("0.0.0.0:0", "*:*", "[::]:0")
+                            and parts[-1].isdigit()
+                        ):
+                            cand = int(parts[-1])
+                            if cand > 0 and cand != os.getpid():
+                                pids.add(cand)
+                taskkill = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe")
+                for pid in pids:
+                    with contextlib.suppress(Exception):
+                        subprocess.run(
+                            [taskkill, "/PID", str(pid), "/T", "/F"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                            timeout=5,
+                        )

@@ -3,6 +3,7 @@ import QtQuick
 Item {
     id: root
     property bool checked: false
+    property bool switchEnabled: true
     property color activeColor: "#E54826"
     property color inactiveColor: "#E8E2D6"
     property color borderColor: "#CFC6B6"
@@ -10,6 +11,7 @@ Item {
 
     width: 40
     height: 22
+    opacity: root.switchEnabled ? 1.0 : 0.55
 
     Rectangle {
         anchors.fill: parent
@@ -35,6 +37,7 @@ Item {
 
     PressArea {
         anchors.fill: parent
+        enabled: root.switchEnabled
         onInvoke: root.toggled(!root.checked)
     }
 }

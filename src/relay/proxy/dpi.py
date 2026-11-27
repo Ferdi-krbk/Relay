@@ -8,7 +8,7 @@ from pathlib import Path
 import time
 from typing import Awaitable, Callable
 
-from relay.proxy.pipe import open_upstream
+from relay.proxy.pipe import abort_writer, open_upstream
 
 TLS_RECORD_HANDSHAKE = 0x16
 MAX_CLIENT_HELLO_LEN = 18432
@@ -232,9 +232,7 @@ async def exchange_hello(
             raise ConnectionError(f"Rejected non-handshake TLS record 0x{response[0]:02x}")
         return reader, writer, response
     except BaseException:
-        writer.close()
-        with contextlib.suppress(OSError):
-            await writer.wait_closed()
+        abort_writer(writer)
         raise
 
 
@@ -247,8 +245,13 @@ async def _connect_and_exchange(
     strategy: str,
     timeout: float = 4.0,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, bytes]:
-    reader, writer = await open_upstream(target_host, port)
-    return await exchange_hello(reader, writer, hello, hostname, delay, strategy, timeout=timeout)
+    writer: asyncio.StreamWriter | None = None
+    try:
+        reader, writer = await open_upstream(target_host, port, timeout=timeout)
+        return await exchange_hello(reader, writer, hello, hostname, delay, strategy, timeout=timeout)
+    except BaseException:
+        abort_writer(writer)
+        raise
 
 
 async def _tunnel_and_exchange(
@@ -370,12 +373,23 @@ async def race_client_hello(
 
         raise last_error or ConnectionError("No TLS handshake strategy succeeded")
     finally:
+        winning_writer = winner[1] if winner is not None else None
+
+        def _cleanup_task(done_task: asyncio.Task) -> None:
+            if done_task.cancelled() or done_task.exception() is not None:
+                return
+            res = done_task.result()
+            if isinstance(res, tuple) and res[1] is not winning_writer:
+                abort_writer(res[1])
+
+        to_cancel: list[asyncio.Task] = []
         for task, _ in all_tasks:
-            if not task.done():
+            if task.done():
+                _cleanup_task(task)
+            else:
+                task.add_done_callback(_cleanup_task)
                 task.cancel()
-        results = await asyncio.gather(*(t for t, _ in all_tasks), return_exceptions=True)
-        for result in results:
-            if isinstance(result, tuple) and (winner is None or result[1] is not winner[1]):
-                result[1].close()
-                with contextlib.suppress(OSError):
-                    await result[1].wait_closed()
+                to_cancel.append(task)
+        if to_cancel:
+            with contextlib.suppress(BaseException):
+                await asyncio.wait(to_cancel, timeout=0.05)
