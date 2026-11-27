@@ -209,7 +209,8 @@ class MasqueTunnel:
         for _ in range(30):
             if self.is_ready():
                 return True
-            if self._process.poll() is not None:
+            proc = self._process
+            if proc is None or proc.poll() is not None:
                 self._process = None
                 return False
             time.sleep(0.15)
