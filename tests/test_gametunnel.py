@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -15,6 +16,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 from relay.core.config import ConfigStore, sanitize_app_name
 from relay.proxy.gametunnel import (
     GameTunnelClient,
+    Socks5UdpShim,
     _is_pid_alive,
     build_singbox_config,
     resolve_game_binaries,
@@ -43,8 +45,13 @@ def test_sanitize_app_name_and_config_persistence(tmp_path: Path):
 
 
 def test_singbox_config_is_valid_and_prevents_loops(tmp_path: Path):
-    cfg = build_singbox_config(["RobloxPlayerBeta.exe", "Discord.exe"], socks_port=11894)
+    cfg = build_singbox_config(["RobloxPlayerBeta.exe", "Discord.exe"], socks_port=11896)
     assert cfg["route"]["final"] == "direct"
+    tun_in = cfg["inbounds"][0]
+    excludes = tun_in.get("route_exclude_address", [])
+    assert "162.159.192.0/21" in excludes
+    assert "1.1.1.1/32" in excludes
+    assert "127.0.0.0/8" in excludes
     rules = cfg["route"]["rules"]
     assert any(r.get("outbound") == "direct" and "usque.exe" in r.get("process_name", []) for r in rules)
     assert any(r.get("outbound") == "direct" and r.get("ip_is_private") is True for r in rules)
@@ -59,6 +66,74 @@ def test_singbox_config_is_valid_and_prevents_loops(tmp_path: Path):
         cfg_file.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
         res = subprocess.run([str(bins[0]), "check", "-c", str(cfg_file)], capture_output=True, text=True, timeout=10)
         assert res.returncode == 0, res.stderr
+
+
+def test_socks5_udp_shim_fixes_zero_port_associate():
+    """Verify Socks5UdpShim translates 0.0.0.0:0 UDP ASSOCIATE into an exact bound port for usque."""
+    up_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    up_udp.bind(("127.0.0.1", 0))
+    up_udp.settimeout(3.0)
+    up_udp_port = up_udp.getsockname()[1]
+
+    up_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    up_tcp.bind(("127.0.0.1", 0))
+    up_tcp.listen(4)
+    up_tcp.settimeout(3.0)
+    up_tcp_port = up_tcp.getsockname()[1]
+
+    expected_client_udp: dict[str, tuple[str, int] | None] = {"addr": None}
+    stop_flag = threading.Event()
+
+    def _strict_usque_server():
+        try:
+            conn, _ = up_tcp.accept()
+            conn.settimeout(3.0)
+            assert conn.recv(3) == b"\x05\x01\x00"
+            conn.sendall(b"\x05\x00")
+            req = conn.recv(10)
+            assert req[:4] == b"\x05\x03\x00\x01"
+            reg_ip = socket.inet_ntoa(req[4:8])
+            reg_port = struct.unpack("!H", req[8:10])[0]
+            # Strict check just like usque: must NOT be 0.0.0.0:0!
+            assert reg_ip == "127.0.0.1" and reg_port > 0
+            expected_client_udp["addr"] = (reg_ip, reg_port)
+            conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack("!H", up_udp_port))
+            data, src = up_udp.recvfrom(2048)
+            assert src == expected_client_udp["addr"], f"UDP src {src} != registered {expected_client_udp['addr']}"
+            up_udp.sendto(b"PONG:" + data, src)
+            stop_flag.wait(timeout=2.0)
+            conn.close()
+        finally:
+            up_tcp.close()
+            up_udp.close()
+
+    srv_thread = threading.Thread(target=_strict_usque_server, daemon=True)
+    srv_thread.start()
+
+    shim = Socks5UdpShim(listen_port=0, upstream_port=up_tcp_port)
+    shim_port = shim.start()
+    try:
+        # Simulate sing-box sending 0.0.0.0:0 on UDP ASSOCIATE
+        c_tcp = socket.create_connection(("127.0.0.1", shim_port), timeout=3.0)
+        c_tcp.sendall(b"\x05\x01\x00")
+        assert c_tcp.recv(2) == b"\x05\x00"
+        c_tcp.sendall(b"\x05\x03\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
+        rep = c_tcp.recv(10)
+        assert rep[:4] == b"\x05\x00\x00\x01"
+        bnd_ip = socket.inet_ntoa(rep[4:8])
+        bnd_port = struct.unpack("!H", rep[8:10])[0]
+
+        c_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        c_udp.settimeout(3.0)
+        c_udp.sendto(b"\x00\x00\x00\x01\x01\x01\x01\x01\x00\x35hello", (bnd_ip, bnd_port))
+        resp, _ = c_udp.recvfrom(2048)
+        assert resp == b"PONG:\x00\x00\x00\x01\x01\x01\x01\x01\x00\x35hello"
+        c_udp.close()
+        c_tcp.close()
+    finally:
+        stop_flag.set()
+        shim.stop()
+        srv_thread.join(timeout=2.0)
 
 
 def test_game_tunnel_supervisor_clean_stop_and_auth(tmp_path: Path, monkeypatch):

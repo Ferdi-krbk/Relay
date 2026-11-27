@@ -12,6 +12,7 @@ Safety guarantees:
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import ctypes
 from ctypes import wintypes
@@ -21,6 +22,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -31,20 +34,250 @@ from urllib.request import ProxyHandler, Request, build_opener
 from relay.core.config import (
     DEFAULT_GAME_APPS,
     GAME_CONTROL_PORT,
+    GAME_SOCKS_SHIM_PORT,
     TUNNEL_PORT,
     default_data_dir,
     sanitize_app_name,
 )
 
 
+# Networks that must NEVER be captured by the Wintun default route:
+# - Loopback & RFC1918 LAN (prevents local/Kaspersky/router loops)
+# - Cloudflare MASQUE endpoints (162.159.192.0/21 covers 162.159.198.2 etc.)
+# - Public DoH resolvers (1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4, 9.9.9.9)
+_TUN_EXCLUDE_CIDRS: list[str] = [
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "162.159.192.0/21",
+    "1.1.1.1/32",
+    "1.0.0.1/32",
+    "8.8.8.8/32",
+    "8.8.4.4/32",
+    "9.9.9.9/32",
+    "9.9.9.10/32",
+    "149.112.112.112/32",
+]
+
+
 def _direct_opener():
     return build_opener(ProxyHandler({}))
+
+
+class Socks5UdpShim:
+    """Loopback SOCKS5 proxy shim that fixes usque's strict UDP ASSOCIATE port check.
+
+    sing-box sends `DST.ADDR = 0.0.0.0:0` on SOCKS5 UDP ASSOCIATE, which usque's
+    SOCKS5 server rejects (`udp address ... is not associated with tcp`).
+    This shim binds a real local UDP socket per association and registers that exact
+    `(127.0.0.1, port)` with usque, while transparently splicing TCP CONNECT streams.
+    """
+
+    def __init__(self, listen_port: int, upstream_port: int):
+        self.listen_port = int(listen_port)
+        self.upstream_port = int(upstream_port)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()
+        self._stop_fut: asyncio.Future | None = None
+        self.bound_port: int = self.listen_port
+
+    def start(self) -> int:
+        if self._thread is not None and self._thread.is_alive():
+            return self.bound_port
+        self._ready.clear()
+        self._thread = threading.Thread(target=self._run, name="relay-socks5-shim", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=3.0):
+            raise RuntimeError("SOCKS5 UDP köprüsü başlatılamadı.")
+        return self.bound_port
+
+    def stop(self) -> None:
+        loop = self._loop
+        fut = self._stop_fut
+        if loop is not None and fut is not None and not loop.is_closed():
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(None))
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        try:
+            loop.run_until_complete(self._serve())
+        except Exception:
+            self._ready.set()
+        finally:
+            with contextlib.suppress(Exception):
+                pending = asyncio.all_tasks(loop)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.close()
+
+    async def _serve(self) -> None:
+        loop = asyncio.get_running_loop()
+        self._stop_fut = loop.create_future()
+        server = await asyncio.start_server(self._handle_client, "127.0.0.1", self.listen_port)
+        sock = server.sockets[0]
+        self.bound_port = int(sock.getsockname()[1])
+        self._ready.set()
+        try:
+            await self._stop_fut
+        finally:
+            server.close()
+            if hasattr(server, "close_clients"):
+                server.close_clients()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(server.wait_closed(), timeout=1.0)
+
+    @staticmethod
+    async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except Exception:
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                writer.close()
+
+    @staticmethod
+    async def _read_socks_addr(reader: asyncio.StreamReader, atyp: int) -> bytes:
+        if atyp == 1:
+            return await reader.readexactly(4 + 2)
+        if atyp == 3:
+            ln = (await reader.readexactly(1))[0]
+            return bytes([ln]) + await reader.readexactly(ln + 2)
+        if atyp == 4:
+            return await reader.readexactly(16 + 2)
+        raise ValueError(f"unsupported atyp {atyp}")
+
+    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        up_writer: asyncio.StreamWriter | None = None
+        client_udp_tr = None
+        up_udp_tr = None
+        try:
+            hdr = await asyncio.wait_for(reader.readexactly(2), timeout=5.0)
+            if hdr[0] != 5:
+                return
+            await asyncio.wait_for(reader.readexactly(hdr[1]), timeout=5.0)
+            writer.write(b"\x05\x00")
+            await writer.drain()
+
+            req_hdr = await asyncio.wait_for(reader.readexactly(4), timeout=5.0)
+            ver, cmd, _rsv, atyp = req_hdr
+            if ver != 5:
+                return
+            addr_bytes = await asyncio.wait_for(self._read_socks_addr(reader, atyp), timeout=5.0)
+
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", self.upstream_port), timeout=5.0
+            )
+            up_writer.write(b"\x05\x01\x00")
+            await up_writer.drain()
+            u_greet = await asyncio.wait_for(up_reader.readexactly(2), timeout=5.0)
+            if u_greet != b"\x05\x00":
+                writer.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                return
+
+            if cmd == 1:  # TCP CONNECT — splice transparently
+                up_writer.write(req_hdr + addr_bytes)
+                await up_writer.drain()
+                t1 = asyncio.create_task(self._pipe(reader, up_writer))
+                t2 = asyncio.create_task(self._pipe(up_reader, writer))
+                await asyncio.gather(t1, t2, return_exceptions=True)
+                return
+
+            if cmd != 3:  # Only CONNECT and UDP ASSOCIATE supported
+                writer.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                return
+
+            # UDP ASSOCIATE: bind dedicated local UDP sockets and register exact port with usque
+            loop = asyncio.get_running_loop()
+            state: dict[str, tuple[str, int] | None] = {"client_addr": None, "usque_addr": None}
+
+            class _ClientUdp(asyncio.DatagramProtocol):
+                def datagram_received(self, data: bytes, addr):
+                    state["client_addr"] = addr
+                    target = state["usque_addr"]
+                    if target is not None and up_udp_tr is not None:
+                        up_udp_tr.sendto(data, target)
+
+            class _UpstreamUdp(asyncio.DatagramProtocol):
+                def datagram_received(self, data: bytes, _addr):
+                    c_addr = state["client_addr"]
+                    if c_addr is not None and client_udp_tr is not None:
+                        client_udp_tr.sendto(data, c_addr)
+
+            client_udp_tr, _ = await loop.create_datagram_endpoint(
+                _ClientUdp, local_addr=("127.0.0.1", 0)
+            )
+            up_udp_tr, _ = await loop.create_datagram_endpoint(
+                _UpstreamUdp, local_addr=("127.0.0.1", 0)
+            )
+
+            c_port = int(client_udp_tr.get_extra_info("sockname")[1])
+            u_port = int(up_udp_tr.get_extra_info("sockname")[1])
+
+            up_writer.write(b"\x05\x03\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack("!H", u_port))
+            await up_writer.drain()
+
+            u_rep_hdr = await asyncio.wait_for(up_reader.readexactly(4), timeout=5.0)
+            u_addr_raw = await asyncio.wait_for(self._read_socks_addr(up_reader, u_rep_hdr[3]), timeout=5.0)
+            if u_rep_hdr[1] != 0:
+                writer.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                return
+
+            if u_rep_hdr[3] == 1:
+                usque_ip = socket.inet_ntoa(u_addr_raw[:4])
+                usque_port = struct.unpack("!H", u_addr_raw[4:6])[0]
+                if usque_ip == "0.0.0.0":
+                    usque_ip = "127.0.0.1"
+            else:
+                usque_ip = "127.0.0.1"
+                usque_port = self.upstream_port
+            state["usque_addr"] = (usque_ip, usque_port)
+
+            writer.write(b"\x05\x00\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack("!H", c_port))
+            await writer.drain()
+
+            # Keep UDP association alive until either TCP control socket closes
+            c_wait = asyncio.create_task(reader.read(64))
+            u_wait = asyncio.create_task(up_reader.read(64))
+            done, pending = await asyncio.wait({c_wait, u_wait}, return_when=asyncio.FIRST_COMPLETED)
+            for p in pending:
+                p.cancel()
+        except Exception:
+            pass
+        finally:
+            for tr in (client_udp_tr, up_udp_tr):
+                if tr is not None:
+                    with contextlib.suppress(Exception):
+                        tr.close()
+            for w in (up_writer, writer):
+                if w is not None:
+                    with contextlib.suppress(Exception):
+                        w.close()
 
 
 def build_singbox_config(
     apps: Iterable[str],
     *,
-    socks_port: int = TUNNEL_PORT,
+    socks_port: int = GAME_SOCKS_SHIM_PORT,
     interface_name: str = "RelayGameTun",
 ) -> dict:
     """Build a sing-box v1.12+ split-tunnel config routing ONLY listed apps via MASQUE SOCKS5."""
@@ -84,6 +317,7 @@ def build_singbox_config(
                 "mtu": 1400,
                 "auto_route": True,
                 "strict_route": False,
+                "route_exclude_address": list(_TUN_EXCLUDE_CIDRS),
                 "stack": "mixed",
             }
         ],
@@ -232,7 +466,7 @@ class GameTunnelClient:
         data_dir: Path | None = None,
         *,
         control_port: int = GAME_CONTROL_PORT,
-        socks_port: int = TUNNEL_PORT,
+        socks_port: int = GAME_SOCKS_SHIM_PORT,
     ):
         self.data_dir = data_dir or default_data_dir()
         self.control_port = control_port
@@ -361,7 +595,23 @@ def run_game_tunnel_supervisor(args) -> None:
 
     log_file = log_path.open("a", encoding="utf-8")
     proc: subprocess.Popen | None = None
+    shim: Socks5UdpShim | None = None
     try:
+        # If sing-box config points to our local SOCKS5 UDP shim port (different from TUNNEL_PORT),
+        # start the loopback UDP-fix shim before launching sing-box so UDP ASSOCIATE works with usque.
+        shim_port = 0
+        with contextlib.suppress(OSError, ValueError, KeyError):
+            parsed_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            for ob in parsed_cfg.get("outbounds", []):
+                if ob.get("tag") == "usque-socks" and ob.get("type") == "socks":
+                    p = int(ob.get("server_port", 0))
+                    if p > 0 and p != TUNNEL_PORT:
+                        shim_port = p
+                    break
+        if shim_port:
+            shim = Socks5UdpShim(listen_port=shim_port, upstream_port=TUNNEL_PORT)
+            shim.start()
+
         proc = subprocess.Popen(
             [str(singbox_exe), "run", "-c", str(cfg_path)],
             cwd=str(singbox_exe.parent),
@@ -429,6 +679,9 @@ def run_game_tunnel_supervisor(args) -> None:
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(OSError):
                     proc.kill()
+        if shim is not None:
+            with contextlib.suppress(Exception):
+                shim.stop()
         if job_handle:
             with contextlib.suppress(Exception):
                 ctypes.WinDLL("kernel32").CloseHandle(wintypes.HANDLE(job_handle))

@@ -11,6 +11,7 @@ from typing import Iterable
 RELAY_PORT = 11893
 TUNNEL_PORT = 11894
 GAME_CONTROL_PORT = 11895
+GAME_SOCKS_SHIM_PORT = 11896
 LEGACY_PORTS: tuple[int, ...] = (11888, 11889, 11890, 11891, 11892)
 ALL_MANAGED_PORTS: tuple[int, ...] = (*LEGACY_PORTS, RELAY_PORT)
 
@@ -28,6 +29,7 @@ DEFAULT_FORCE_DOMAINS: tuple[str, ...] = (
 
 DEFAULT_GAME_APPS: tuple[str, ...] = (
     "RobloxPlayerBeta.exe",
+    "RobloxPlayerLauncher.exe",
     "RobloxStudioBeta.exe",
     "Discord.exe",
 )
