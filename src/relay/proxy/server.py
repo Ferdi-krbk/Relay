@@ -111,6 +111,7 @@ class ProxyServer:
         self._doh_hosts: set[str] = set()
         self._tunnel_roots: set[str] = set()
         self._tunnel_failures = 0
+        self._first_tunnel_fail_ts = 0.0
         self._last_tunnel_restart = 0.0
         self._tunnel_restarting = False
         self.telemetry = ProxyTelemetry(mode=mode.value, doh_enabled=doh_enabled)
@@ -150,12 +151,12 @@ class ProxyServer:
             return True
         if self.mode == NetworkMode.STRICT and not domain_matches(hostname, STRICT_DIRECT_DOMAINS):
             return True
-        # Adaptive strict-network detection: once any domain on the current network
-        # required MASQUE (cleared automatically on Wi-Fi/IP change), route all
-        # force_fragment_domains straight to MASQUE with 0ms wait.
+        # Adaptive strict-network detection: once 2+ distinct root domains on the
+        # current network required MASQUE (e.g. campus firewall blocking all fragments),
+        # route all force_fragment_domains straight to MASQUE with 0ms wait.
         if (
             self.mode == NetworkMode.AUTO
-            and self._tunnel_roots
+            and len(self._tunnel_roots) >= 2
             and domain_matches(hostname, self.force_fragment_domains)
             and not domain_matches(hostname, STRICT_DIRECT_DOMAINS)
         ):
@@ -174,6 +175,18 @@ class ProxyServer:
             elif root == "rbxcdn.com":
                 self._tunnel_roots.add("roblox.com")
 
+    async def _prewarm_tunnel(self) -> None:
+        """Complete usque's lazy initial MASQUE handshake in the background so user tabs open in ~200ms."""
+        if self.tunnel_port is None:
+            return
+        with contextlib.suppress(Exception):
+            _r, w = await open_socks5_upstream(self.tunnel_host, self.tunnel_port, "1.1.1.1", 443, timeout=10.0)
+            w.close()
+            with contextlib.suppress(OSError):
+                await w.wait_closed()
+            self._tunnel_failures = 0
+            self._first_tunnel_fail_ts = 0.0
+
     async def _start_managed_tunnel(self) -> None:
         if self._managed_tunnel is None:
             return
@@ -184,12 +197,13 @@ class ProxyServer:
                 f"Relay MASQUE tunnel ready: socks5://{self._managed_tunnel.host}:{self._managed_tunnel.port}",
                 flush=True,
             )
+            asyncio.create_task(self._prewarm_tunnel())
 
     async def _restart_managed_tunnel(self) -> None:
         if self._managed_tunnel is None or self._tunnel_restarting:
             return
         now = time.monotonic()
-        if now - self._last_tunnel_restart < 10.0:
+        if now - self._last_tunnel_restart < 30.0:
             return
         self._tunnel_restarting = True
         self._last_tunnel_restart = now
@@ -198,19 +212,33 @@ class ProxyServer:
             ok = await asyncio.to_thread(self._managed_tunnel.start)
             self.tunnel_port = self._managed_tunnel.port if ok else None
             self._tunnel_failures = 0
+            self._first_tunnel_fail_ts = 0.0
+            if ok:
+                asyncio.create_task(self._prewarm_tunnel())
         finally:
             self._tunnel_restarting = False
 
     def _on_tunnel_failure(self) -> None:
+        now = time.monotonic()
+        if self._tunnel_failures == 0:
+            self._first_tunnel_fail_ts = now
         self._tunnel_failures += 1
-        if self._tunnel_failures >= 2 and self._managed_tunnel is not None:
+        if self._managed_tunnel is None:
+            return
+        # Never kill a healthy usque because 2 parallel Chrome sockets timed out on one slow origin;
+        # only restart if the SOCKS port died OR sustained failures lasted >= 8s with zero successes.
+        port_dead = not self._managed_tunnel.is_ready()
+        sustained = self._tunnel_failures >= 6 and (now - self._first_tunnel_fail_ts) >= 8.0
+        if port_dead or sustained:
             asyncio.create_task(self._restart_managed_tunnel())
 
     async def _open_tunnel(self, hostname: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         if self.tunnel_port is None:
             raise ConnectionError("Tunnel fallback is not active")
         try:
-            res = await open_socks5_upstream(self.tunnel_host, self.tunnel_port, hostname, port, timeout=5.0)
+            res = await open_socks5_upstream(self.tunnel_host, self.tunnel_port, hostname, port, timeout=9.0)
+            self._tunnel_failures = 0
+            self._first_tunnel_fail_ts = 0.0
             return res
         except (OSError, asyncio.TimeoutError):
             self._on_tunnel_failure()
@@ -654,7 +682,7 @@ class ProxyServer:
                         return await self._open_tunnel(h, p)
 
                     tunnel_cb = _tracked_tunnel_open if self.tunnel_port is not None else None
-                    adaptive_tunnel_delay = 0.30 if len(self._tunnel_roots) >= 2 else 0.90
+                    adaptive_tunnel_delay = 0.35 if (force_frag or len(self._tunnel_roots) >= 2) else 0.55
                     try:
                         if cached:
                             try:

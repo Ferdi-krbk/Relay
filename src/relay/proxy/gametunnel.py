@@ -35,10 +35,12 @@ from relay.core.config import (
     DEFAULT_GAME_APPS,
     GAME_CONTROL_PORT,
     GAME_SOCKS_SHIM_PORT,
+    GAME_TUNNEL_PORT,
     TUNNEL_PORT,
     default_data_dir,
     sanitize_app_name,
 )
+from relay.proxy.tunnel import MasqueTunnel
 
 
 # Networks that must NEVER be captured by the Wintun default route:
@@ -596,9 +598,11 @@ def run_game_tunnel_supervisor(args) -> None:
     log_file = log_path.open("a", encoding="utf-8")
     proc: subprocess.Popen | None = None
     shim: Socks5UdpShim | None = None
+    game_masque: MasqueTunnel | None = None
     try:
         # If sing-box config points to our local SOCKS5 UDP shim port (different from TUNNEL_PORT),
-        # start the loopback UDP-fix shim before launching sing-box so UDP ASSOCIATE works with usque.
+        # run a dedicated isolated MasqueTunnel on GAME_TUNNEL_PORT so heavy game UDP/TCP traffic
+        # never shares or head-of-line blocks the Web Proxy's MASQUE connection on TUNNEL_PORT.
         shim_port = 0
         with contextlib.suppress(OSError, ValueError, KeyError):
             parsed_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -609,7 +613,25 @@ def run_game_tunnel_supervisor(args) -> None:
                         shim_port = p
                     break
         if shim_port:
-            shim = Socks5UdpShim(listen_port=shim_port, upstream_port=TUNNEL_PORT)
+            upstream_socks = TUNNEL_PORT
+            gm = MasqueTunnel(host="127.0.0.1", port=GAME_TUNNEL_PORT, data_dir=data_dir)
+            if gm.start():
+                game_masque = gm
+                upstream_socks = GAME_TUNNEL_PORT
+                if job_handle and gm._process is not None:
+                    _assign_pid_to_job(job_handle, gm._process.pid)
+
+                def _prewarm_game_masque():
+                    with contextlib.suppress(Exception):
+                        with socket.create_connection(("127.0.0.1", GAME_TUNNEL_PORT), timeout=10.0) as s:
+                            s.settimeout(10.0)
+                            s.sendall(b"\x05\x01\x00")
+                            if s.recv(2) == b"\x05\x00":
+                                s.sendall(b"\x05\x01\x00\x01\x01\x01\x01\x01\x01\xbb")
+                                s.recv(10)
+
+                threading.Thread(target=_prewarm_game_masque, daemon=True).start()
+            shim = Socks5UdpShim(listen_port=shim_port, upstream_port=upstream_socks)
             shim.start()
 
         proc = subprocess.Popen(
@@ -685,6 +707,9 @@ def run_game_tunnel_supervisor(args) -> None:
         if shim is not None:
             with contextlib.suppress(Exception):
                 shim.stop()
+        if game_masque is not None:
+            with contextlib.suppress(Exception):
+                game_masque.stop()
         if job_handle:
             with contextlib.suppress(Exception):
                 ctypes.WinDLL("kernel32").CloseHandle(wintypes.HANDLE(job_handle))

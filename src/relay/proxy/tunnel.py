@@ -131,7 +131,7 @@ class MasqueTunnel:
         self.port = port
         self.data_dir = data_dir or default_data_dir()
         self.config_path = self.data_dir / "usque-config.json"
-        self.log_path = self.data_dir / "usque.log"
+        self.log_path = self.data_dir / ("usque.log" if port == TUNNEL_PORT else f"usque-{port}.log")
         self._process: subprocess.Popen | None = None
 
     @property
@@ -185,6 +185,8 @@ class MasqueTunnel:
             "-p",
             str(self.port),
             "--http2",
+            "-s",
+            "cloudflare.com",
             "--always-reconnect",
             "-k",
             "10s",

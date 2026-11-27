@@ -255,7 +255,7 @@ async def _tunnel_and_exchange(
     tunnel_connect: Callable[[], Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]]],
     hello: bytes,
     hostname: str,
-    timeout: float = 6.0,
+    timeout: float = 8.5,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, bytes]:
     reader, writer = await tunnel_connect()
     return await exchange_hello(reader, writer, hello, hostname, 0.0, "direct", timeout=timeout)
@@ -276,7 +276,7 @@ async def race_client_hello(
     force_fragment: bool = False,
     hello_timeout: float = 4.0,
     tunnel_connect: Callable[[], Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]]] | None = None,
-    tunnel_delay: float = 0.9,
+    tunnel_delay: float = 0.55,
 ) -> tuple[tuple[asyncio.StreamReader, asyncio.StreamWriter, bytes], str]:
     """Race TLS handshake strategies; the winning upstream socket carries the session."""
     all_tasks: list[tuple[asyncio.Task, str]] = []
