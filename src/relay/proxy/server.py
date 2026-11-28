@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import ssl
 import time
 from urllib.parse import urlsplit
 
@@ -209,16 +210,20 @@ class ProxyServer:
             return True
         if self.mode == NetworkMode.STRICT and not domain_matches(hostname, STRICT_DIRECT_DOMAINS):
             return True
-        # Strict campus/firewall shortcut ONLY when ZERO fragmentation handshakes have
+        # Strict campus/Eduroam shortcut ONLY when ZERO fragmentation handshakes have
         # succeeded on the current network (`len(self._frag_roots) == 0`). On home ISPs
         # where TCP/TLS fragmentation works at full line speed, NEVER blanket-force domains
         # into the slower MASQUE tunnel.
-        if len(self._frag_roots) == 0 and len(self._tunnel_roots) >= 2:
+        if len(self._frag_roots) == 0 and self._tunnel_roots:
             if domain_matches(hostname, STRICT_DIRECT_DOMAINS):
                 return False
             if self._root_domain(hostname) in self._tunnel_roots:
                 return True
-            if self.mode == NetworkMode.AUTO and domain_matches(hostname, self.force_fragment_domains):
+            if (
+                len(self._tunnel_roots) >= 2
+                and self.mode == NetworkMode.AUTO
+                and domain_matches(hostname, self.force_fragment_domains)
+            ):
                 return True
         return False
 
@@ -246,6 +251,64 @@ class ProxyServer:
         self.strategies.set(hostname, "tunnel", persist=False)
         if root and len(self._frag_roots) == 0:
             self._tunnel_roots.add(root)
+
+    @staticmethod
+    def _build_probe_client_hello(hostname: str) -> bytes:
+        incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+        ctx = ssl.create_default_context()
+        sobj = ctx.wrap_bio(incoming, outgoing, server_hostname=hostname)
+        with contextlib.suppress(ssl.SSLWantReadError):
+            sobj.do_handshake()
+        return outgoing.read()
+
+    async def _probe_single_frag_host(self, hostname: str) -> str | None:
+        ip = await self.resolver.resolve(hostname) if self.resolver.enabled else None
+        target = ip or hostname
+        hello = self._build_probe_client_hello(hostname)
+        try:
+            r, w = await open_upstream(target, 443, timeout=1.3)
+        except (OSError, asyncio.TimeoutError):
+            return None
+        try:
+            (_, win_w, _), strat = await race_client_hello(
+                r,
+                w,
+                hello,
+                hostname,
+                target,
+                443,
+                delay=self.delay,
+                race_delay=self.race_delay,
+                prefer_tls_records=self.prefer_tls_records,
+                race_both=self.race_both,
+                force_fragment=True,
+                hello_timeout=1.4,
+                tunnel_connect=None,
+                tunnel_delay=None,
+            )
+            abort_writer(win_w)
+            return strat
+        except (OSError, asyncio.TimeoutError):
+            return None
+
+    async def _probe_network_profile(self) -> None:
+        """Classify Home ISP (1 Gbps TCP frag) vs Eduroam/Campus firewall (~0ms MASQUE) at startup/roam."""
+        if not self.prewarm_doh or not self.resolver.enabled or self.mode != NetworkMode.AUTO:
+            return
+        probe_hosts = ("discord.com", "www.roblox.com")
+        ips = await asyncio.gather(*(self.resolver.resolve(h) for h in probe_hosts), return_exceptions=True)
+        if not any(isinstance(ip, str) and ip for ip in ips):
+            return
+        results = await asyncio.gather(*(self._probe_single_frag_host(h) for h in probe_hosts), return_exceptions=True)
+        any_succeeded = False
+        for host, res in zip(probe_hosts, results):
+            if isinstance(res, str) and res in ("direct", "tcp_frag", "tls_record"):
+                any_succeeded = True
+                self._record_frag_host(host, res)
+                self.strategies.set(host, res, persist=(res != "direct"))
+        if not any_succeeded and len(self._frag_roots) == 0:
+            for host in probe_hosts:
+                self._record_tunnel_host(host)
 
     async def _prewarm_tunnel(self) -> None:
         """Complete usque's lazy initial MASQUE handshake in the background so user tabs open in ~200ms."""
@@ -375,6 +438,7 @@ class ProxyServer:
                 self.flush_caches(clear_persisted=False)
                 if self.prewarm_doh and self.resolver.enabled:
                     self._spawn_bg(self.resolver.prewarm())
+                    self._spawn_bg(self._probe_network_profile())
                 if self._managed_tunnel is not None:
                     self._spawn_bg(self._restart_managed_tunnel())
             if (
@@ -416,6 +480,8 @@ class ProxyServer:
             flush=True,
         )
         warmup_task = asyncio.create_task(self.resolver.prewarm()) if self.prewarm_doh else None
+        if self.prewarm_doh and self.resolver.enabled:
+            self._spawn_bg(self._probe_network_profile())
         tunnel_task = asyncio.create_task(self._start_managed_tunnel()) if self._managed_tunnel is not None else None
         monitor_task = asyncio.create_task(self._network_monitor())
         try:
@@ -697,7 +763,7 @@ class ProxyServer:
                     self.strategies.invalidate(hostname)
                     cached = None
 
-            connect_timeout = 3.0 if self.tunnel_port is not None else 8.0
+            connect_timeout = (1.5 if len(self._frag_roots) == 0 else 3.0) if self.tunnel_port is not None else 8.0
             if not via_tunnel:
                 # Smart DNS: Normal unblocked hosts use instant system DNS (local CDN edge);
                 # DoH is used upfront only for forced domains or hosts that previously needed DoH.
@@ -719,7 +785,7 @@ class ProxyServer:
                                 )
                                 self._doh_hosts.add(hostname)
                                 opened = True
-                    elif resolved_ip:
+                    elif resolved_ip and (self.tunnel_port is None or not force_frag):
                         target_host = hostname
                         with contextlib.suppress(OSError, asyncio.TimeoutError):
                             upstream_reader, upstream = await open_upstream(hostname, port, timeout=connect_timeout)

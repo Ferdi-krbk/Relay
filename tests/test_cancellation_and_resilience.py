@@ -381,3 +381,57 @@ def test_home_isp_frag_roots_prevent_root_or_cdn_tunnel_poisoning():
     assert proxy._should_use_tunnel_directly("friends.roblox.com", None) is False
     assert proxy._should_use_tunnel_directly("tr.rbxcdn.com", None) is False
     assert proxy._should_use_tunnel_directly("discord.com", None) is False
+
+
+def test_eduroam_auto_probe_enables_zero_wait_tunnel_and_roam_home_recovers(monkeypatch):
+    """On Eduroam (where both probe hosts fail fragmentation), blocked sites route straight to MASQUE in 0ms;
+    when roaming back to Home Wi-Fi (where fragmentation works), 1 Gbps TCP fragmentation resumes immediately."""
+
+    async def _run():
+        proxy = ProxyServer(
+            port=0,
+            mode=NetworkMode.AUTO,
+            doh_enabled=True,
+            prewarm_doh=True,
+            tunnel_port=11894,
+            force_fragment_domains=("discord.com", "roblox.com", "wattpad.com", "pastebin.com"),
+        )
+
+        async def _fake_resolve(host: str):
+            return "162.159.138.232"
+
+        monkeypatch.setattr(proxy.resolver, "resolve", _fake_resolve)
+
+        # 1. Simulate Eduroam firewall: fragmentation completely blocked on probe hosts
+        async def _eduroam_blocked_probe(host: str):
+            return None
+
+        monkeypatch.setattr(proxy, "_probe_single_frag_host", _eduroam_blocked_probe)
+        await proxy._probe_network_profile()
+
+        assert len(proxy._frag_roots) == 0
+        assert {"discord.com", "roblox.com"}.issubset(proxy._tunnel_roots)
+        # User opens Wattpad/Roblox/Discord on Eduroam -> 0ms instant tunnel!
+        assert proxy._should_use_tunnel_directly("www.wattpad.com", None) is True
+        assert proxy._should_use_tunnel_directly("friends.roblox.com", None) is True
+        assert proxy._should_use_tunnel_directly("pastebin.com", None) is True
+        # Unblocked high-bandwidth services (YouTube/Google) still stay direct!
+        assert proxy._should_use_tunnel_directly("www.youtube.com", None) is False
+
+        # 2. Simulate roaming back to Home 1 Gbps Wi-Fi: flush + re-probe succeeds via tcp_frag
+        proxy.flush_caches(clear_persisted=False)
+
+        async def _home_working_probe(host: str):
+            return "tcp_frag"
+
+        monkeypatch.setattr(proxy, "_probe_single_frag_host", _home_working_probe)
+        await proxy._probe_network_profile()
+
+        assert {"discord.com", "roblox.com"}.issubset(proxy._frag_roots)
+        assert len(proxy._tunnel_roots) == 0
+        assert proxy._should_use_tunnel_directly("www.wattpad.com", None) is False
+        assert proxy._should_use_tunnel_directly("friends.roblox.com", None) is False
+        assert proxy._should_use_tunnel_directly("discord.com", None) is False
+        proxy.resolver.close()
+
+    asyncio.run(_run())
