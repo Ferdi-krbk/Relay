@@ -3,13 +3,104 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
+from ctypes import wintypes
+import ipaddress
+import os
 import socket
+import struct
+import time
 
 from relay.core.telemetry import ProxyTelemetry
 
-SOCKET_BUFFER_BYTES = 4 * 1024 * 1024   # 4 MB kernel send/recv buffers
+SOCKET_BUFFER_BYTES = 1024 * 1024       # 1 MB user-space backpressure high-water (zero upload bufferbloat + full 1 Gbps+ burst headroom)
 STREAM_LIMIT_BYTES = 2 * 1024 * 1024    # 2 MB StreamReader limit
-WRITE_LOW_WATER = 1 * 1024 * 1024       # 1 MB low-water flow control
+WRITE_LOW_WATER = 256 * 1024            # 256 KB low-water flow control
+_WIN_IP_UNICAST_IF = 31                 # Winsock IP_UNICAST_IF option (network byte order DWORD)
+
+_if_cache_idx: int = 0
+_if_cache_until: float = 0.0
+
+
+if os.name == "nt":
+    class _MIB_IPFORWARDROW(ctypes.Structure):
+        _fields_ = [
+            ("dwForwardDest", wintypes.DWORD),
+            ("dwForwardMask", wintypes.DWORD),
+            ("dwForwardPolicy", wintypes.DWORD),
+            ("dwForwardNextHop", wintypes.DWORD),
+            ("dwForwardIfIndex", wintypes.DWORD),
+            ("dwForwardType", wintypes.DWORD),
+            ("dwForwardProto", wintypes.DWORD),
+            ("dwForwardAge", wintypes.DWORD),
+            ("dwForwardNextHopAS", wintypes.DWORD),
+            ("dwForwardMetric1", wintypes.DWORD),
+            ("dwForwardMetric2", wintypes.DWORD),
+            ("dwForwardMetric3", wintypes.DWORD),
+            ("dwForwardMetric4", wintypes.DWORD),
+            ("dwForwardMetric5", wintypes.DWORD),
+        ]
+
+
+def _query_physical_default_if_index() -> int:
+    """Return physical IPv4 gateway IfIndex when RelayGameTun (172.19.0.0/30) captures default routes.
+
+    When Game Mode (`sing-box` Wintun `auto_route`) is active, unbound outbound sockets from
+    Relay would otherwise traverse `RelayGameTun`'s user-space gVisor TCP stack, reassembling
+    DPI-bypass TCP fragments back into a single blocked ClientHello and capping 1 Gbps speed.
+    """
+    if os.name != "nt":
+        return 0
+    global _if_cache_idx, _if_cache_until
+    now = time.monotonic()
+    if now < _if_cache_until:
+        return _if_cache_idx
+
+    idx = 0
+    try:
+        # Zero-packet routing lookup to check whether default public routes point at RelayGameTun (172.19.*)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("198.41.0.4", 80))
+            routed_ip = str(probe.getsockname()[0])
+        if routed_ip.startswith("172.19."):
+            iphlpapi = ctypes.windll.iphlpapi
+            size = wintypes.ULONG(0)
+            iphlpapi.GetIpForwardTable(None, ctypes.byref(size), False)
+            if size.value > 4:
+                buf = ctypes.create_string_buffer(size.value)
+                if iphlpapi.GetIpForwardTable(buf, ctypes.byref(size), False) == 0:
+                    count = struct.unpack_from("<I", buf, 0)[0]
+                    row_size = ctypes.sizeof(_MIB_IPFORWARDROW)
+                    best_metric = 1 << 30
+                    offset = 4
+                    for _ in range(count):
+                        if offset + row_size > size.value:
+                            break
+                        row = _MIB_IPFORWARDROW.from_buffer_copy(buf, offset)
+                        offset += row_size
+                        # Physical router route is exact 0.0.0.0/0 (Wintun auto_route uses /1 split masks)
+                        if row.dwForwardDest == 0 and row.dwForwardMask == 0 and row.dwForwardNextHop != 0:
+                            nh = socket.inet_ntoa(struct.pack("<I", row.dwForwardNextHop))
+                            if not nh.startswith("172.19.") and int(row.dwForwardMetric1) < best_metric:
+                                best_metric = int(row.dwForwardMetric1)
+                                idx = int(row.dwForwardIfIndex)
+    except OSError:
+        idx = 0
+
+    _if_cache_idx = idx
+    _if_cache_until = now + 2.0
+    return idx
+
+
+def _is_local_or_private_host(host: str) -> bool:
+    clean = host.strip("[]").lower()
+    if clean in ("localhost", "::1", "0.0.0.0") or clean.endswith(".local"):
+        return True
+    try:
+        ip_obj = ipaddress.ip_address(clean)
+        return ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local or ip_obj.is_unspecified
+    except ValueError:
+        return False
 
 
 def abort_writer(writer: asyncio.StreamWriter | None) -> None:
@@ -25,7 +116,11 @@ def abort_writer(writer: asyncio.StreamWriter | None) -> None:
 
 
 def tune_socket(writer: asyncio.StreamWriter) -> None:
-    """Configure low-latency and 1 Gbps+ throughput socket options."""
+    """Configure low-latency and multi-gigabit throughput socket options.
+
+    Intentionally preserves Windows Receive Window Auto-Tuning (never sets fixed SO_RCVBUF/SO_SNDBUF,
+    which disables dynamic RFC 7323 window scaling up to 16 MB on Windows 10/11).
+    """
     transport = writer.transport
     if transport is not None:
         with contextlib.suppress(Exception):
@@ -36,10 +131,47 @@ def tune_socket(writer: asyncio.StreamWriter) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         with contextlib.suppress(OSError):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        with contextlib.suppress(OSError):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_BYTES)
-        with contextlib.suppress(OSError):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_BYTES)
+
+
+async def _connect_bound_physical(
+    target_host: str,
+    port: int,
+    if_index: int,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Connect an IPv4 socket bound via IP_UNICAST_IF to the physical NIC, bypassing Wintun."""
+    loop = asyncio.get_running_loop()
+    try:
+        ip_obj = ipaddress.ip_address(target_host.strip("[]"))
+        if ip_obj.version == 4 and not (ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local):
+            infos = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (str(ip_obj), port))]
+        else:
+            return await asyncio.open_connection(target_host, port, limit=STREAM_LIMIT_BYTES)
+    except ValueError:
+        infos = await loop.getaddrinfo(target_host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        if not infos:
+            return await asyncio.open_connection(target_host, port, limit=STREAM_LIMIT_BYTES)
+
+    last_err: OSError | None = None
+    for af, socktype, proto, _, sockaddr in infos:
+        addr_ip = str(sockaddr[0])
+        if af != socket.AF_INET or _is_local_or_private_host(addr_ip):
+            return await asyncio.open_connection(target_host, port, limit=STREAM_LIMIT_BYTES)
+        sock = socket.socket(af, socktype, proto)
+        try:
+            sock.setblocking(False)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.IPPROTO_IP, _WIN_IP_UNICAST_IF, struct.pack("!I", if_index))
+            await loop.sock_connect(sock, sockaddr)
+            return await asyncio.open_connection(sock=sock, limit=STREAM_LIMIT_BYTES)
+        except OSError as exc:
+            last_err = exc
+            with contextlib.suppress(OSError):
+                sock.close()
+        except BaseException:
+            with contextlib.suppress(OSError):
+                sock.close()
+            raise
+    raise last_err or ConnectionError(f"Unable to connect to {target_host}:{port}")
 
 
 async def open_upstream(
@@ -47,9 +179,13 @@ async def open_upstream(
     port: int,
     timeout: float = 8.0,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    conn_task = asyncio.create_task(
-        asyncio.open_connection(target_host, port, limit=STREAM_LIMIT_BYTES)
+    if_idx = 0 if _is_local_or_private_host(target_host) else _query_physical_default_if_index()
+    coro = (
+        _connect_bound_physical(target_host, port, if_idx)
+        if if_idx > 0
+        else asyncio.open_connection(target_host, port, limit=STREAM_LIMIT_BYTES)
     )
+    conn_task = asyncio.create_task(coro)
     try:
         reader, writer = await asyncio.wait_for(asyncio.shield(conn_task), timeout=timeout)
     except BaseException:

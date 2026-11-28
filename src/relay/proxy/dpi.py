@@ -279,9 +279,9 @@ async def race_client_hello(
     force_fragment: bool = False,
     hello_timeout: float = 4.0,
     tunnel_connect: Callable[[], Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]]] | None = None,
-    tunnel_delay: float = 0.55,
+    tunnel_delay: float | None = None,
 ) -> tuple[tuple[asyncio.StreamReader, asyncio.StreamWriter, bytes], str]:
-    """Race TLS handshake strategies; the winning upstream socket carries the session."""
+    """Race TLS handshake strategies; tunnel is strictly last-resort unless tunnel_delay is set."""
     all_tasks: list[tuple[asyncio.Task, str]] = []
     winner = None
     last_error: BaseException | None = None
@@ -339,7 +339,11 @@ async def race_client_hello(
                         winner = task.result()
                         return winner, strat
 
-        tunnel_deadline = time.monotonic() + max(0.05, tunnel_delay)
+        tunnel_deadline = (
+            time.monotonic() + max(0.05, tunnel_delay)
+            if tunnel_delay is not None
+            else None
+        )
         while pending or (tunnel_connect is not None and not tunnel_launched):
             if not pending and tunnel_connect is not None and not tunnel_launched:
                 t_task = asyncio.create_task(_tunnel_and_exchange(tunnel_connect, hello, hostname))
@@ -349,7 +353,7 @@ async def race_client_hello(
                 tunnel_launched = True
 
             wait_timeout: float | None = None
-            if tunnel_connect is not None and not tunnel_launched:
+            if tunnel_deadline is not None and tunnel_connect is not None and not tunnel_launched:
                 wait_timeout = max(0.0, tunnel_deadline - time.monotonic())
 
             completed, pending = await asyncio.wait(
@@ -364,7 +368,12 @@ async def race_client_hello(
                 except (OSError, asyncio.TimeoutError) as error:
                     last_error = error
 
-            if not completed and tunnel_connect is not None and not tunnel_launched:
+            if (
+                not completed
+                and tunnel_deadline is not None
+                and tunnel_connect is not None
+                and not tunnel_launched
+            ):
                 t_task = asyncio.create_task(_tunnel_and_exchange(tunnel_connect, hello, hostname))
                 all_tasks.append((t_task, "tunnel"))
                 task_to_strat[t_task] = "tunnel"

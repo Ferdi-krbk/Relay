@@ -23,7 +23,6 @@ DEFAULT_FORCE_DOMAINS: tuple[str, ...] = (
     "discord.gg",
     "discord.media",
     "roblox.com",
-    "rbxcdn.com",
     "wattpad.com",
     "pastebin.com",
 )

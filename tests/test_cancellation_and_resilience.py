@@ -300,3 +300,84 @@ def test_abrupt_client_disconnect_storm_cleans_up_zero_leaks():
             await up.wait_closed()
 
     asyncio.run(_run())
+
+
+def test_tunnel_is_strictly_last_resort_never_steals_slow_fragmentation():
+    """Even if US-origin TCP fragmentation takes 450ms, tunnel must NEVER launch or steal the race."""
+
+    async def _run():
+        tunnel_calls = {"n": 0}
+
+        async def _us_origin_srv(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+            try:
+                first = await reader.read(8)
+                # Unfragmented ClientHello (>2 bytes at once) is silently dropped by ISP DPI;
+                # fragmented ClientHello (1-2 byte initial chunk) succeeds after 450ms US RTT.
+                if len(first) <= 2:
+                    await asyncio.sleep(0.05)
+                    _ = await reader.read(2048)
+                    await asyncio.sleep(0.40)
+                    writer.write(b"\x16\x03\x03\x00\x04OKAY")
+                    await writer.drain()
+                else:
+                    await asyncio.sleep(2.0)
+            finally:
+                writer.close()
+
+        async def _should_not_be_called_tunnel():
+            tunnel_calls["n"] += 1
+            raise AssertionError("Tunnel should never be called when fragmentation succeeds")
+
+        srv = await asyncio.start_server(_us_origin_srv, "127.0.0.1", 0)
+        port = srv.sockets[0].getsockname()[1]
+        try:
+            r0, w0 = await asyncio.open_connection("127.0.0.1", port)
+            (win_r, win_w, resp), strat = await race_client_hello(
+                r0,
+                w0,
+                _build_dummy_client_hello("friends.roblox.com"),
+                "friends.roblox.com",
+                "127.0.0.1",
+                port,
+                delay=0.0,
+                race_delay=0.05,
+                prefer_tls_records=False,
+                race_both=False,
+                force_fragment=True,
+                hello_timeout=2.0,
+                tunnel_connect=_should_not_be_called_tunnel,
+                tunnel_delay=None,
+            )
+            assert strat == "tcp_frag"
+            assert resp == b"\x16\x03\x03\x00\x04OKAY"
+            assert tunnel_calls["n"] == 0
+            win_w.close()
+        finally:
+            srv.close()
+            await srv.wait_closed()
+
+    asyncio.run(_run())
+
+
+def test_home_isp_frag_roots_prevent_root_or_cdn_tunnel_poisoning():
+    """Once fragmentation works on a home ISP, a flaky host must never poison roblox.com or rbxcdn.com."""
+    proxy = ProxyServer(
+        port=0,
+        mode=NetworkMode.AUTO,
+        doh_enabled=False,
+        prewarm_doh=False,
+        tunnel_port=11894,
+        force_fragment_domains=("roblox.com", "discord.com", "wattpad.com"),
+    )
+    proxy._record_frag_host("www.roblox.com", "tcp_frag")
+    assert "roblox.com" in proxy._frag_roots
+    assert proxy._root_frag_strategy["roblox.com"] == "tcp_frag"
+
+    # A single transient fallback on one subdomain must NOT cache tunnel or poison siblings/CDN
+    proxy._record_tunnel_host("flaky.roblox.com")
+    assert "roblox.com" not in proxy._tunnel_roots
+    assert "rbxcdn.com" not in proxy._tunnel_roots
+    assert proxy.strategies.get("flaky.roblox.com") is None
+    assert proxy._should_use_tunnel_directly("friends.roblox.com", None) is False
+    assert proxy._should_use_tunnel_directly("tr.rbxcdn.com", None) is False
+    assert proxy._should_use_tunnel_directly("discord.com", None) is False

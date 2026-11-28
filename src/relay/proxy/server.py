@@ -149,7 +149,10 @@ class ProxyServer:
         self.resolver = DoHResolver(enabled=doh_enabled)
         self.strategies = StrategyCache(persist_path=learned_path)
         self._doh_hosts: set[str] = set()
+        self._frag_roots: set[str] = set()
+        self._root_frag_strategy: dict[str, str] = {}
         self._tunnel_roots: set[str] = set()
+        self._tunnel_host_streaks: dict[str, int] = {}
         self._tunnel_failures = 0
         self._first_tunnel_fail_ts = 0.0
         self._last_tunnel_restart = 0.0
@@ -204,33 +207,45 @@ class ProxyServer:
             return False
         if cached == "tunnel":
             return True
-        if self._root_domain(hostname) in self._tunnel_roots:
-            return True
         if self.mode == NetworkMode.STRICT and not domain_matches(hostname, STRICT_DIRECT_DOMAINS):
             return True
-        # Adaptive strict-network detection: once 2+ distinct root domains on the
-        # current network required MASQUE (e.g. campus firewall blocking all fragments),
-        # route all force_fragment_domains straight to MASQUE with 0ms wait.
-        if (
-            self.mode == NetworkMode.AUTO
-            and len(self._tunnel_roots) >= 2
-            and domain_matches(hostname, self.force_fragment_domains)
-            and not domain_matches(hostname, STRICT_DIRECT_DOMAINS)
-        ):
-            return True
+        # Strict campus/firewall shortcut ONLY when ZERO fragmentation handshakes have
+        # succeeded on the current network (`len(self._frag_roots) == 0`). On home ISPs
+        # where TCP/TLS fragmentation works at full line speed, NEVER blanket-force domains
+        # into the slower MASQUE tunnel.
+        if len(self._frag_roots) == 0 and len(self._tunnel_roots) >= 2:
+            if domain_matches(hostname, STRICT_DIRECT_DOMAINS):
+                return False
+            if self._root_domain(hostname) in self._tunnel_roots:
+                return True
+            if self.mode == NetworkMode.AUTO and domain_matches(hostname, self.force_fragment_domains):
+                return True
         return False
+
+    def _record_frag_host(self, hostname: str, strategy: str) -> None:
+        self._tunnel_host_streaks.pop(hostname, None)
+        if strategy in ("tcp_frag", "tls_record"):
+            root = self._root_domain(hostname)
+            if root:
+                self._frag_roots.add(root)
+                self._root_frag_strategy[root] = strategy
+                self._tunnel_roots.discard(root)
 
     def _record_tunnel_host(self, hostname: str) -> None:
         if domain_matches(hostname, STRICT_DIRECT_DOMAINS):
             return
-        self.strategies.set(hostname, "tunnel", persist=False)
         root = self._root_domain(hostname)
-        if root and not domain_matches(root, STRICT_DIRECT_DOMAINS):
+        streak = self._tunnel_host_streaks.get(hostname, 0) + 1
+        self._tunnel_host_streaks[hostname] = streak
+        if root in self._frag_roots:
+            # Fragmentation is proven to work on this root domain on this network;
+            # never poison sibling subdomains, and require 2 consecutive failures on this exact host.
+            if streak >= 2:
+                self.strategies.set(hostname, "tunnel", persist=False)
+            return
+        self.strategies.set(hostname, "tunnel", persist=False)
+        if root and len(self._frag_roots) == 0:
             self._tunnel_roots.add(root)
-            if root == "roblox.com":
-                self._tunnel_roots.add("rbxcdn.com")
-            elif root == "rbxcdn.com":
-                self._tunnel_roots.add("roblox.com")
 
     async def _prewarm_tunnel(self) -> None:
         """Complete usque's lazy initial MASQUE handshake in the background so user tabs open in ~200ms."""
@@ -304,7 +319,10 @@ class ProxyServer:
         """Reset strategy cache, DoH-required host set, and pooled DoH sockets."""
         self.strategies.clear(include_persisted=clear_persisted)
         self._doh_hosts.clear()
+        self._frag_roots.clear()
+        self._root_frag_strategy.clear()
         self._tunnel_roots.clear()
+        self._tunnel_host_streaks.clear()
         self.resolver.flush()
 
     def apply_live_config(self, payload: dict) -> dict:
@@ -661,12 +679,15 @@ class ProxyServer:
                 await bridge_streams(reader, writer, upstream_reader, upstream, self.telemetry)
                 return
 
-            cached = self.strategies.get(hostname)
+            root = self._root_domain(hostname)
             force_frag = domain_matches(hostname, self.force_fragment_domains)
+            cached = self.strategies.get(hostname)
+            if cached is None and force_frag:
+                cached = self._root_frag_strategy.get(root)
             via_tunnel = False
             resolved_ip: str | None = None
             target_host = hostname
-            hello_timeout = 2.5 if self.tunnel_port is not None else 4.0
+            hello_timeout = (1.6 if len(self._frag_roots) == 0 else 2.2) if self.tunnel_port is not None else 4.0
 
             if self._should_use_tunnel_directly(hostname, cached):
                 try:
@@ -750,13 +771,15 @@ class ProxyServer:
                         return await self._open_tunnel(h, p)
 
                     tunnel_cb = _tracked_tunnel_open if self.tunnel_port is not None else None
-                    adaptive_tunnel_delay = 0.35 if (force_frag or len(self._tunnel_roots) >= 2) else 0.55
+                    # Strictly use MASQUE tunnel ONLY after direct + TCP/TLS fragmentation all fail.
+                    adaptive_tunnel_delay = None
                     try:
                         if cached:
                             try:
                                 u_r, u_w, f_resp = await exchange_hello(
                                     upstream_reader, upstream, hello, hostname, self.delay, cached, timeout=hello_timeout
                                 )
+                                self._record_frag_host(hostname, cached)
                             except (OSError, asyncio.TimeoutError):
                                 self.strategies.invalidate(hostname)
                                 if not resolved_ip and self.resolver.enabled:
@@ -786,6 +809,7 @@ class ProxyServer:
                                     self._tunnel_failures = 0
                                     self._record_tunnel_host(hostname)
                                 else:
+                                    self._record_frag_host(hostname, u_strat)
                                     if resolved_ip and u_strat != "direct":
                                         self._doh_hosts.add(hostname)
                                     self.strategies.set(
@@ -846,6 +870,7 @@ class ProxyServer:
                                 self._tunnel_failures = 0
                                 self._record_tunnel_host(hostname)
                             else:
+                                self._record_frag_host(hostname, u_strat)
                                 self.strategies.set(
                                     hostname,
                                     u_strat,
@@ -895,9 +920,8 @@ class ProxyServer:
                     "MASQUE" if via_tunnel else "plain",
                 )
 
-            # Only watch for post-ServerHello blackholes on non-whitelisted hosts whose
-            # initial TLS flight looked incomplete (< 1500 bytes); never cut live streams
-            # (e.g. YouTube LL-HLS / googlevideo) or IP-bound video CDNs.
+            # Only watch for post-ServerHello blackholes on strict networks where fragmentation
+            # has never succeeded and the initial TLS flight was a bare <200B ServerHello without cert.
             first_resp_len = len(first_response) if is_tls else 0
             stall_watch = (
                 4.5
@@ -906,7 +930,8 @@ class ProxyServer:
                     and not via_tunnel
                     and used_strategy != "tunnel"
                     and self.tunnel_port is not None
-                    and first_resp_len < 1500
+                    and len(self._frag_roots) == 0
+                    and first_resp_len < 200
                     and not domain_matches(hostname, STRICT_DIRECT_DOMAINS)
                 )
                 else None

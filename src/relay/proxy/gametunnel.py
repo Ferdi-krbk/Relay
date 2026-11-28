@@ -344,9 +344,8 @@ def build_singbox_config(
             "auto_detect_interface": True,
             "default_domain_resolver": "local",
             "rules": [
-                {"action": "sniff"},
-                {"protocol": "dns", "action": "hijack-dns"},
                 {"process_name": self_procs, "action": "route", "outbound": "direct"},
+                {"port": 53, "action": "hijack-dns"},
                 {"ip_is_private": True, "action": "route", "outbound": "direct"},
                 {"process_name": cleaned, "action": "route", "outbound": "usque-socks"},
             ],
